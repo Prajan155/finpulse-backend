@@ -28,6 +28,7 @@ platformdirs==4.9.2
 protobuf==7.34.0
 psycopg==3.3.3
 psycopg-binary==3.3.3
+psycopg2-binary==2.9.9
 pycparser==3.0
 pydantic==2.12.5
 pydantic-settings==2.13.1
