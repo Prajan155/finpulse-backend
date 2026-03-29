@@ -103,7 +103,12 @@ def answer_firepulse(question: str, symbol: Optional[str] = None):
             "recommendation": recommendation,
         }
 
-    rag_items = retrieve_context(question=question, symbol=normalized_symbol, top_k=5)
+    try:
+        rag_items = retrieve_context(question=question, symbol=normalized_symbol, top_k=5)
+    except Exception as exc:
+        print("FirePulse retrieve_context failed:", exc)
+        rag_items = []
+
     prompt = build_prompt(question=question, data=data, rag_items=rag_items)
     answer = generate_firepulse_response(prompt)
 
