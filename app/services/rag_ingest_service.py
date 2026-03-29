@@ -200,12 +200,20 @@ def ingest_knowledge_base() -> Dict[str, int | List[str]]:
         keep_vectors.append(vectors[i])
 
     if keep_docs:
-        collection.add(
-            ids=keep_ids,
-            documents=keep_docs,
-            metadatas=keep_metas,
-            embeddings=keep_vectors,
-        )
+        chunk_meta = {
+            "symbol": str(meta["symbol"] or ""),
+            "topic": str(meta["topic"] or "general"),
+            "source": str(meta["source"] or "txt"),
+            "path": str(meta["path"]),
+            "chunk_index": int(idx),
+        }
+        if keep_docs and keep_vectors and len(keep_docs) == len(keep_vectors):
+            collection.add(
+                ids=keep_ids,
+                documents=keep_docs,
+                metadatas=keep_metas,
+                embeddings=keep_vectors,
+            )
 
     return {
         "files": len(files),

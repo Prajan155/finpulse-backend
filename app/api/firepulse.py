@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.schemas.firepulse import FirePulseRequest, FirePulseResponse
 from app.services.firepulse_chat_service import answer_firepulse
@@ -14,4 +14,8 @@ def firepulse_chat(payload: FirePulseRequest):
 
 @router.post("/reindex")
 def firepulse_reindex():
-    return ingest_knowledge_base()
+    try:
+        return ingest_knowledge_base()
+    except Exception as exc:
+        print("FirePulse reindex error:", repr(exc))
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {repr(exc)}")
