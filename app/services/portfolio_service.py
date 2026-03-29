@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List
 
 from app.core.cache import ttl_cache
@@ -21,36 +22,95 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def _safe_symbol(value) -> str:
+    return str(value or "").upper().strip()
+
+
 def _normalize_weights(positions: List[dict]) -> List[dict]:
-    cleaned = []
-    total = 0.0
+    """
+    Accepts either:
+    - explicit weights
+    - shares/quantity + avg_buy_price/average_price
+    Merges duplicate symbols and derives weights when missing.
+    """
+    merged: Dict[str, dict] = {}
 
-    for p in positions:
-        symbol = str(p.get("symbol", "")).upper().strip()
-        weight = _safe_float(p.get("weight"), 0.0)
-        shares = _safe_float(p.get("shares"), 0.0)
-        avg_buy_price = _safe_float(p.get("avg_buy_price"), 0.0)
-
+    for p in positions or []:
+        symbol = _safe_symbol(p.get("symbol"))
         if not symbol:
             continue
 
-        cleaned.append(
-            {
-                "symbol": symbol,
-                "weight": weight,
-                "shares": shares,
-                "avg_buy_price": avg_buy_price,
-            }
+        shares = _safe_float(
+            p.get("shares", p.get("quantity")),
+            0.0,
         )
-        total += weight
+        avg_buy_price = _safe_float(
+            p.get("avg_buy_price", p.get("average_price")),
+            0.0,
+        )
+        explicit_weight = _safe_float(p.get("weight"), 0.0)
 
-    if total <= 0:
+        if symbol not in merged:
+            merged[symbol] = {
+                "symbol": symbol,
+                "weight": 0.0,
+                "shares": 0.0,
+                "avg_buy_price": 0.0,
+                "invested_value": 0.0,
+            }
+
+        item = merged[symbol]
+
+        previous_shares = item["shares"]
+        previous_invested = item["invested_value"]
+
+        current_invested = shares * avg_buy_price
+        total_shares = previous_shares + shares
+        total_invested = previous_invested + current_invested
+
+        item["shares"] = total_shares
+        item["invested_value"] = total_invested
+        item["weight"] += explicit_weight
+
+        if total_shares > 0:
+            item["avg_buy_price"] = total_invested / total_shares
+        elif avg_buy_price > 0:
+            item["avg_buy_price"] = avg_buy_price
+
+    cleaned = list(merged.values())
+    if not cleaned:
         return []
 
+    total_explicit_weight = sum(max(0.0, _safe_float(p.get("weight"), 0.0)) for p in cleaned)
+
+    if total_explicit_weight > 0:
+        return [
+            {
+                "symbol": p["symbol"],
+                "weight": _safe_float(p["weight"], 0.0) / total_explicit_weight,
+                "shares": _safe_float(p.get("shares"), 0.0),
+                "avg_buy_price": _safe_float(p.get("avg_buy_price"), 0.0),
+            }
+            for p in cleaned
+        ]
+
+    total_invested = sum(max(0.0, _safe_float(p.get("invested_value"), 0.0)) for p in cleaned)
+    if total_invested > 0:
+        return [
+            {
+                "symbol": p["symbol"],
+                "weight": _safe_float(p.get("invested_value"), 0.0) / total_invested,
+                "shares": _safe_float(p.get("shares"), 0.0),
+                "avg_buy_price": _safe_float(p.get("avg_buy_price"), 0.0),
+            }
+            for p in cleaned
+        ]
+
+    equal_weight = 1.0 / len(cleaned)
     return [
         {
             "symbol": p["symbol"],
-            "weight": p["weight"] / total if total > 0 else 0.0,
+            "weight": equal_weight,
             "shares": _safe_float(p.get("shares"), 0.0),
             "avg_buy_price": _safe_float(p.get("avg_buy_price"), 0.0),
         }
@@ -204,6 +264,12 @@ def _build_ai_summary(
     return _dedupe_list(lines, limit=8)
 
 
+def _fetch_symbol_bundle(symbol: str) -> tuple[str, dict, dict]:
+    rec = get_stock_recommendation(symbol) or {}
+    profile = get_company_profile(symbol) or {}
+    return symbol, rec, profile
+
+
 def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
     if not norm_positions:
         return {
@@ -225,21 +291,33 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
         }
 
     symbols = [p["symbol"] for p in norm_positions]
+    unique_symbols = list(dict.fromkeys(symbols))
+
     stock_recs: Dict[str, dict] = {}
     profiles: Dict[str, dict] = {}
     sector_weights = defaultdict(float)
     warnings: List[str] = []
 
+    max_workers = min(8, max(1, len(unique_symbols)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_fetch_symbol_bundle, symbol): symbol
+            for symbol in unique_symbols
+        }
+        for future in as_completed(future_map):
+            symbol = future_map[future]
+            try:
+                _, rec, profile = future.result()
+            except Exception:
+                rec, profile = {}, {}
+            stock_recs[symbol] = rec or {}
+            profiles[symbol] = profile or {}
+
     for p in norm_positions:
         symbol = p["symbol"]
         weight = p["weight"]
-
-        rec = get_stock_recommendation(symbol)
-        profile = get_company_profile(symbol) or {}
+        profile = profiles.get(symbol, {}) or {}
         sector = profile.get("sector") or "Unknown"
-
-        stock_recs[symbol] = rec
-        profiles[symbol] = profile
         sector_weights[sector] += weight
 
     portfolio_score = 0.0
@@ -247,7 +325,7 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
 
     for p in norm_positions:
         symbol = p["symbol"]
-        rec = stock_recs[symbol]
+        rec = stock_recs.get(symbol, {}) or {}
 
         portfolio_score += p["weight"] * _safe_float(rec.get("score"), 0.0)
         portfolio_confidence += p["weight"] * _safe_float(rec.get("confidence"), 0.0)
@@ -258,9 +336,9 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
     diversification_score = 0.5
     avg_corr = 0.0
 
-    if len(symbols) >= 2:
+    if len(unique_symbols) >= 2:
         try:
-            corr = get_correlation_matrix(symbols, range_="6mo")
+            corr = get_correlation_matrix(unique_symbols, range_="6mo")
             matrix = corr.get("matrix", []) or []
             avg_corr = _avg_offdiag_corr(matrix)
             diversification_score = round(_clamp(1.0 - avg_corr, 0.0, 1.0), 2)
@@ -285,16 +363,14 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
     for p in norm_positions:
         symbol = p["symbol"]
         weight = p["weight"]
-        rec = stock_recs[symbol]
+        rec = stock_recs.get(symbol, {}) or {}
 
         regime = rec.get("regime", "balanced")
         upside_percent = _safe_float(rec.get("upside_percent"), 0.0)
         confidence = _safe_float(rec.get("confidence"), 0.0)
         score = _safe_float(rec.get("score"), 5.0)
 
-        regime_risk = (
-            1.0 if regime == "high_volatility" else 0.6 if regime == "growth" else 0.35
-        )
+        regime_risk = 1.0 if regime == "high_volatility" else 0.6 if regime == "growth" else 0.35
         downside_risk = abs(min(upside_percent, 0.0)) / 15.0
         low_score_risk = max(0.0, (5.0 - score) / 5.0)
 
@@ -315,7 +391,7 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
     )
     risk_level = _risk_level_from_score(risk_score)
 
-    if high_vol_count >= max(2, len(symbols) // 2):
+    if high_vol_count >= max(2, len(unique_symbols) // 2):
         warnings.append("Portfolio contains multiple high-volatility positions")
 
     weights = [p["weight"] for p in norm_positions]
@@ -327,13 +403,13 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
 
     for p in norm_positions:
         symbol = p["symbol"]
-        rec = stock_recs[symbol]
+        rec = stock_recs.get(symbol, {}) or {}
         score = _safe_float(rec.get("score"), 5.0)
         confidence = _safe_float(rec.get("confidence"), 0.5)
 
         desirability = max(0.05, (score / 10.0) * (0.6 + 0.4 * confidence))
 
-        sector = profiles[symbol].get("sector") or "Unknown"
+        sector = (profiles.get(symbol, {}) or {}).get("sector") or "Unknown"
         sector_penalty = 1.0
         if sector_weights[sector] > 0.45:
             sector_penalty = 0.85
@@ -356,8 +432,8 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
         shares = _safe_float(p.get("shares"), 0.0)
         avg_buy_price = _safe_float(p.get("avg_buy_price"), 0.0)
 
-        rec = stock_recs[symbol]
-        profile = profiles[symbol]
+        rec = stock_recs.get(symbol, {}) or {}
+        profile = profiles.get(symbol, {}) or {}
 
         score = _safe_float(rec.get("score"), 5.0)
         confidence = _safe_float(rec.get("confidence"), 0.5)
@@ -382,9 +458,7 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
         action = _action_from_score(score, current_weight, target_weight)
 
         reasons = rec.get("reasons", [])
-        primary_reason = (
-            reasons[0] if reasons else "Based on portfolio score and diversification needs"
-        )
+        primary_reason = reasons[0] if reasons else "Based on portfolio score and diversification needs"
 
         recommendations.append(
             {
@@ -404,9 +478,7 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
 
         current_value = shares * current_price
         gain_loss = current_value - invested_value
-        return_percent = (
-            (gain_loss / invested_value) * 100 if invested_value > 0 else 0.0
-        )
+        return_percent = (gain_loss / invested_value) * 100 if invested_value > 0 else 0.0
 
         holdings.append(
             {
@@ -439,7 +511,7 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
 
     return {
         "norm_positions": norm_positions,
-        "symbols": symbols,
+        "symbols": unique_symbols,
         "stock_recs": stock_recs,
         "profiles": profiles,
         "sector_weights": dict(sector_weights),
@@ -483,6 +555,7 @@ def get_portfolio_recommendation(positions: List[dict]) -> Dict:
     }
 
 
+@ttl_cache(prefix="portfolio_overview", ttl_seconds=180)
 def get_portfolio_overview(positions: List[dict]) -> Dict:
     norm_positions = _normalize_weights(positions)
     base = _build_base_portfolio_context(norm_positions)

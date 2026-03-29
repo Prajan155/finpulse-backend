@@ -1,0 +1,4 @@
+Return on equity measures how efficiently a company generates profit from shareholder capital.
+A higher ROE usually indicates stronger capital efficiency, but it should be checked alongside debt levels.
+An unusually high ROE can sometimes come from high leverage rather than strong business quality.
+ROE is more meaningful when compared against sector peers and the company’s own historical average.

@@ -125,6 +125,15 @@ def _fetch_history_df(
     return df
 
 
+def _prepare_series_for_arima(series: pd.Series, freq: str) -> pd.Series:
+    s = series.dropna().copy()
+    s.index = pd.DatetimeIndex(s.index)
+    s = s.sort_index()
+    s = s.asfreq(freq)
+    s = s.ffill().dropna()
+    return s
+
+
 @ttl_cache(prefix="symbol_search", ttl_seconds=120)
 def search_symbols(q: str, market: str = "ALL", limit: int = 10) -> dict:
     q = (q or "").strip()
@@ -219,10 +228,17 @@ def get_ratios(ticker: str) -> dict:
     t = yf.Ticker(ticker)
 
     info = {}
+    fast = {}
+
     try:
         info = t.info or {}
     except Exception:
-        logger.warning("Failed to fetch info for ratios ticker=%s", ticker)
+        logger.warning("info fetch failed for %s", ticker)
+
+    try:
+        fast = t.fast_info or {}
+    except Exception:
+        logger.warning("fast_info fetch failed for %s", ticker)
 
     def _to_percent(value):
         val = _safe_float_or_none(value)
@@ -237,8 +253,14 @@ def get_ratios(ticker: str) -> dict:
 
         return val
 
-    market_cap = _safe_float_or_none(info.get("marketCap"))
-    pe_ttm = _safe_float_or_none(info.get("trailingPE"))
+    market_cap = _safe_float_or_none(
+        info.get("marketCap")
+        or fast.get("market_cap")
+    )
+    pe_ttm = _safe_float_or_none(
+        info.get("trailingPE")
+        or info.get("forwardPE")
+    )
     pb = _safe_float_or_none(info.get("priceToBook"))
     ps_ttm = _safe_float_or_none(info.get("priceToSalesTrailing12Months"))
     dividend_yield = _to_percent(info.get("dividendYield"))
@@ -384,6 +406,8 @@ def get_intraday_forecast_arima(
             }
 
         close = df["Close"].dropna()
+        freq = "5min" if interval == "5m" else "15min"
+        close = _prepare_series_for_arima(close, freq)
 
         min_points = 60 if interval == "5m" else 40
         if len(close) < min_points:
@@ -523,6 +547,8 @@ def get_long_range_forecast_arima(
             }
 
         close = df["Close"].dropna()
+        close = _prepare_series_for_arima(close, "B")
+
         if len(close) < 60:
             return {
                 "symbol": ticker,
@@ -744,7 +770,7 @@ def get_revenue_expenses(ticker: str, frequency: str = "quarterly") -> dict:
         }
 
 
-_quote_cache = TTLCache(maxsize=5000, ttl=10)
+_quote_cache = TTLCache(maxsize=5000, ttl=60)
 
 
 def _now_iso():
@@ -754,12 +780,19 @@ def _now_iso():
 def get_quote(ticker: str) -> dict:
     ticker = ticker.strip().upper()
 
-    if ticker in _quote_cache:
-        return _quote_cache[ticker]
+    cached = _quote_cache.get(ticker)
+    if cached:
+        has_price = cached.get("price") is not None
+        has_change = cached.get("change") is not None
+        has_change_percent = cached.get("changePercent") is not None
+
+        if has_price and has_change and has_change_percent:
+            return cached
 
     t = yf.Ticker(ticker)
 
     price = None
+    prev_close = None
     change = None
     change_pct = None
     currency = None
@@ -771,11 +804,19 @@ def get_quote(ticker: str) -> dict:
     try:
         fast = t.fast_info
         if fast:
-            price = fast.get("last_price") or fast.get("lastPrice")
+            price = (
+                fast.get("lastPrice")
+                or fast.get("last_price")
+                or fast.get("regularMarketPrice")
+            )
+            prev_close = (
+                fast.get("previousClose")
+                or fast.get("previous_close")
+            )
             currency = fast.get("currency")
             exchange = fast.get("exchange")
     except Exception:
-        logger.info("fast_info unavailable for ticker=%s, falling back to info", ticker)
+        logger.info("fast_info unavailable for ticker=%s, falling back", ticker)
 
     try:
         info = t.info or {}
@@ -785,6 +826,7 @@ def get_quote(ticker: str) -> dict:
             or info.get("longName")
             or info.get("displayName")
             or info.get("name")
+            or ticker
         )
 
         exchange = (
@@ -810,21 +852,46 @@ def get_quote(ticker: str) -> dict:
                 or info.get("previousClose")
             )
 
-        prev_close = (
-            info.get("regularMarketPreviousClose")
-            or info.get("previousClose")
-        )
-
-        if price is not None and prev_close is not None and float(prev_close) != 0:
-            change = float(price) - float(prev_close)
-            change_pct = (change / float(prev_close)) * 100
+        if prev_close is None:
+            prev_close = (
+                info.get("regularMarketPreviousClose")
+                or info.get("previousClose")
+            )
 
     except Exception:
         logger.exception("Failed quote info fetch for ticker=%s", ticker)
 
+    try:
+        hist = _fetch_history_df(ticker, "5d", "1d", for_label="quote fallback")
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            closes = hist["Close"].dropna()
+
+            if len(closes) >= 2:
+                hist_price = float(closes.iloc[-1])
+                hist_prev_close = float(closes.iloc[-2])
+
+                price = hist_price
+                prev_close = hist_prev_close
+                change = hist_price - hist_prev_close
+                change_pct = (change / hist_prev_close) * 100 if hist_prev_close not in (None, 0) else None
+
+            elif len(closes) == 1:
+                hist_price = float(closes.iloc[-1])
+                price = hist_price if price is None else price
+                prev_close = hist_price if prev_close in (None, 0) else prev_close
+    except Exception:
+        logger.warning("History fallback failed for ticker=%s", ticker)
+
+    try:
+        if change is None and price is not None and prev_close not in (None, 0):
+            change = float(price) - float(prev_close)
+            change_pct = (change / float(prev_close)) * 100
+    except Exception:
+        logger.warning("Failed change calculation for ticker=%s", ticker)
+
     out = {
         "symbol": ticker,
-        "name": name,
+        "name": name or ticker,
         "exchange": exchange,
         "market": market,
         "currency": currency,
@@ -835,7 +902,13 @@ def get_quote(ticker: str) -> dict:
         "asOf": _now_iso(),
     }
 
-    _quote_cache[ticker] = out
+    if (
+        out["price"] is not None
+        and out["change"] is not None
+        and out["changePercent"] is not None
+    ):
+        _quote_cache[ticker] = out
+
     return out
 
 

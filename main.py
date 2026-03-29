@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.core.init_db import init_db
 from app.core.middleware import log_requests_middleware
+from app.api.firepulse import router as firepulse_router
 
 app = FastAPI(
     title=settings.app_name,
@@ -48,3 +49,4 @@ app.add_middleware(
 
 app.include_router(api_router, prefix=settings.api_prefix)
 app.include_router(health_router, prefix=settings.api_prefix)
+app.include_router(firepulse_router, prefix=settings.api_prefix + "/firepulse", tags=["FirePulse"])
