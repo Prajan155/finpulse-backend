@@ -1,4 +1,5 @@
 from typing import Iterable, List
+
 from google import genai
 from app.core.config import settings
 
@@ -47,7 +48,6 @@ def embed_texts(texts: Iterable[str]) -> List[List[float]]:
     return vectors
 
 
-# 🔥 ADD THIS (CRITICAL)
 def embed_one(text: str):
     vectors = embed_texts([text])
     if not vectors:
