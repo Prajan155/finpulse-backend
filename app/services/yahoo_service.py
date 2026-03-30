@@ -687,10 +687,6 @@ def get_correlation_matrix(tickers: list[str], range_: str = "6mo") -> dict:
 
 
 def _pick_row(df: pd.DataFrame, candidates: list[str]) -> pd.Series | None:
-    """
-    yfinance financials are usually: rows=metrics, cols=periods
-    This finds the first matching row name.
-    """
     if df is None or df.empty:
         return None
     for name in candidates:
@@ -701,10 +697,6 @@ def _pick_row(df: pd.DataFrame, candidates: list[str]) -> pd.Series | None:
 
 @ttl_cache(prefix="revenue_expenses", ttl_seconds=1800)
 def get_revenue_expenses(ticker: str, frequency: str = "quarterly") -> dict:
-    """
-    Returns revenue vs expenses points for charting.
-    frequency: "quarterly" (default) or "annual"
-    """
     ticker = ticker.strip().upper()
 
     try:
@@ -780,6 +772,14 @@ def _now_iso():
 def get_quote(ticker: str) -> dict:
     ticker = ticker.strip().upper()
 
+    cached = _quote_cache.get(ticker)
+    if cached:
+        has_price = cached.get("price") is not None
+        has_change = cached.get("change") is not None
+        has_change_percent = cached.get("changePercent") is not None
+        if has_price and has_change and has_change_percent:
+            return cached
+
     t = yf.Ticker(ticker)
 
     price = None
@@ -795,8 +795,15 @@ def get_quote(ticker: str) -> dict:
 
     try:
         fast = t.fast_info or {}
-        price = fast.get("lastPrice") or fast.get("last_price") or fast.get("regularMarketPrice")
-        prev_close = fast.get("previousClose") or fast.get("previous_close")
+        price = (
+            fast.get("lastPrice")
+            or fast.get("last_price")
+            or fast.get("regularMarketPrice")
+        )
+        prev_close = (
+            fast.get("previousClose")
+            or fast.get("previous_close")
+        )
         currency = fast.get("currency")
         exchange = fast.get("exchange")
     except Exception:
@@ -808,42 +815,67 @@ def get_quote(ticker: str) -> dict:
             info.get("shortName")
             or info.get("longName")
             or info.get("displayName")
+            or info.get("name")
             or ticker
         )
-        exchange = exchange or info.get("exchange") or info.get("fullExchangeName")
-        market = info.get("market") or info.get("marketType") or info.get("exchangeTimezoneName")
+        exchange = (
+            exchange
+            or info.get("exchange")
+            or info.get("fullExchangeName")
+            or info.get("quoteExchange")
+        )
+        market = (
+            info.get("market")
+            or info.get("marketType")
+            or info.get("exchangeTimezoneName")
+        )
         currency = currency or info.get("currency")
         market_state = info.get("marketState")
 
         if price is None:
-            price = info.get("regularMarketPrice") or info.get("currentPrice")
+            price = (
+                info.get("regularMarketPrice")
+                or info.get("currentPrice")
+                or info.get("previousClose")
+            )
+
         if prev_close is None:
-            prev_close = info.get("regularMarketPreviousClose") or info.get("previousClose")
+            prev_close = (
+                info.get("regularMarketPreviousClose")
+                or info.get("previousClose")
+            )
     except Exception:
         logger.info("info unavailable for ticker=%s", ticker)
 
     try:
-        df = yf.download(
+        hist = _fetch_history_df(ticker, "5d", "1d", for_label="quote fallback")
+
+        logger.info(
+            "Quote fallback ticker=%s hist_exists=%s hist_empty=%s columns=%s",
             ticker,
-            period="5d",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
+            hist is not None,
+            None if hist is None else hist.empty,
+            None if hist is None else list(hist.columns),
         )
 
-        if df is not None and not df.empty and "Close" in df.columns:
-            closes = df["Close"].dropna()
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            closes = hist["Close"].dropna()
 
             if len(closes) >= 2:
-                price = float(closes.iloc[-1])
-                prev_close = float(closes.iloc[-2])
-                change = price - prev_close
-                change_pct = (change / prev_close) * 100 if prev_close else None
+                hist_price = float(closes.iloc[-1])
+                hist_prev_close = float(closes.iloc[-2])
+
+                price = hist_price
+                prev_close = hist_prev_close
+                change = hist_price - hist_prev_close
+                change_pct = (change / hist_prev_close) * 100 if hist_prev_close not in (None, 0) else None
+
             elif len(closes) == 1:
-                price = float(closes.iloc[-1])
-                if prev_close is None:
-                    prev_close = price
+                hist_price = float(closes.iloc[-1])
+                if price is None:
+                    price = hist_price
+                if prev_close in (None, 0):
+                    prev_close = hist_price
     except Exception:
         logger.exception("History fallback failed for ticker=%s", ticker)
 
@@ -854,18 +886,34 @@ def get_quote(ticker: str) -> dict:
         except Exception:
             logger.warning("Failed change calculation for ticker=%s", ticker)
 
-    return {
+    if ticker.endswith(".NS") or ticker.endswith(".BO"):
+        currency = currency or "INR"
+        market = market or "India"
+    else:
+        currency = currency or "USD"
+        market = market or "US"
+
+    out = {
         "symbol": ticker,
         "name": name or ticker,
         "exchange": exchange,
         "market": market,
-        "currency": currency or ("INR" if ticker.endswith(".NS") else "USD"),
+        "currency": currency,
         "price": _safe_float_or_none(price),
         "change": _safe_float_or_none(change),
         "changePercent": _safe_float_or_none(change_pct),
         "marketState": market_state,
         "asOf": _now_iso(),
     }
+
+    if (
+        out["price"] is not None
+        and out["change"] is not None
+        and out["changePercent"] is not None
+    ):
+        _quote_cache[ticker] = out
+
+    return out
 
 
 def get_company_profile(symbol: str) -> dict:
