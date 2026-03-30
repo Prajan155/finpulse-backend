@@ -793,73 +793,76 @@ def get_quote(ticker: str) -> dict:
     market = None
     market_state = None
 
-    # ❌ Try fast_info (often fails on Render)
     try:
         fast = t.fast_info or {}
-        price = fast.get("lastPrice") or fast.get("regularMarketPrice")
-        prev_close = fast.get("previousClose")
+        price = fast.get("lastPrice") or fast.get("last_price") or fast.get("regularMarketPrice")
+        prev_close = fast.get("previousClose") or fast.get("previous_close")
         currency = fast.get("currency")
         exchange = fast.get("exchange")
     except Exception:
-        pass
+        logger.info("fast_info unavailable for ticker=%s", ticker)
 
-    # ❌ Try info (often fails on Render)
     try:
         info = t.info or {}
-
         name = (
             info.get("shortName")
             or info.get("longName")
+            or info.get("displayName")
             or ticker
         )
-
-        exchange = exchange or info.get("exchange")
-        market = info.get("market")
+        exchange = exchange or info.get("exchange") or info.get("fullExchangeName")
+        market = info.get("market") or info.get("marketType") or info.get("exchangeTimezoneName")
         currency = currency or info.get("currency")
+        market_state = info.get("marketState")
 
         if price is None:
-            price = info.get("regularMarketPrice")
-
+            price = info.get("regularMarketPrice") or info.get("currentPrice")
         if prev_close is None:
-            prev_close = info.get("previousClose")
-
+            prev_close = info.get("regularMarketPreviousClose") or info.get("previousClose")
     except Exception:
-        pass
+        logger.info("info unavailable for ticker=%s", ticker)
 
-    # 🔥 FORCE HISTORY FALLBACK (THIS FIXES EVERYTHING)
     try:
-        df = yf.download(ticker, period="5d", interval="1d", progress=False)
+        df = yf.download(
+            ticker,
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
 
-        if df is not None and not df.empty:
+        if df is not None and not df.empty and "Close" in df.columns:
             closes = df["Close"].dropna()
 
             if len(closes) >= 2:
                 price = float(closes.iloc[-1])
                 prev_close = float(closes.iloc[-2])
                 change = price - prev_close
-                change_pct = (change / prev_close) * 100 if prev_close != 0 else None
-
+                change_pct = (change / prev_close) * 100 if prev_close else None
             elif len(closes) == 1:
                 price = float(closes.iloc[-1])
-                prev_close = price
-
+                if prev_close is None:
+                    prev_close = price
     except Exception:
-        logger.exception("History fallback failed")
+        logger.exception("History fallback failed for ticker=%s", ticker)
 
-    # compute change if still missing
     if change is None and price is not None and prev_close not in (None, 0):
-        change = price - prev_close
-        change_pct = (change / prev_close) * 100
+        try:
+            change = float(price) - float(prev_close)
+            change_pct = (change / float(prev_close)) * 100
+        except Exception:
+            logger.warning("Failed change calculation for ticker=%s", ticker)
 
     return {
         "symbol": ticker,
-        "name": name,
+        "name": name or ticker,
         "exchange": exchange,
         "market": market,
         "currency": currency or ("INR" if ticker.endswith(".NS") else "USD"),
-        "price": price,
-        "change": change,
-        "changePercent": change_pct,
+        "price": _safe_float_or_none(price),
+        "change": _safe_float_or_none(change),
+        "changePercent": _safe_float_or_none(change_pct),
         "marketState": market_state,
         "asOf": _now_iso(),
     }
