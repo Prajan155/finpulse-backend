@@ -848,34 +848,27 @@ def get_quote(ticker: str) -> dict:
         logger.info("info unavailable for ticker=%s", ticker)
 
     try:
+    # 🔥 FIRST TRY DAILY
         hist = _fetch_history_df(ticker, "5d", "1d", for_label="quote fallback")
 
-        logger.info(
-            "Quote fallback ticker=%s hist_exists=%s hist_empty=%s columns=%s",
-            ticker,
-            hist is not None,
-            None if hist is None else hist.empty,
-            None if hist is None else list(hist.columns),
-        )
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            # 🔥 FORCE INTRADAY FALLBACK (VERY RELIABLE)
+            hist = _fetch_history_df(ticker, "1d", "1m", for_label="intraday fallback")
 
         if hist is not None and not hist.empty and "Close" in hist.columns:
             closes = hist["Close"].dropna()
 
             if len(closes) >= 2:
-                hist_price = float(closes.iloc[-1])
-                hist_prev_close = float(closes.iloc[-2])
-
-                price = hist_price
-                prev_close = hist_prev_close
-                change = hist_price - hist_prev_close
-                change_pct = (change / hist_prev_close) * 100 if hist_prev_close not in (None, 0) else None
+                price = float(closes.iloc[-1])
+                prev_close = float(closes.iloc[-2])
+                change = price - prev_close
+                change_pct = (change / prev_close) * 100 if prev_close else None
 
             elif len(closes) == 1:
-                hist_price = float(closes.iloc[-1])
-                if price is None:
-                    price = hist_price
-                if prev_close in (None, 0):
-                    prev_close = hist_price
+                price = float(closes.iloc[-1])
+                if prev_close is None:
+                    prev_close = price
+
     except Exception:
         logger.exception("History fallback failed for ticker=%s", ticker)
 
