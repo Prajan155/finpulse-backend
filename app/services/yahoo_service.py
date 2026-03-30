@@ -780,136 +780,89 @@ def _now_iso():
 def get_quote(ticker: str) -> dict:
     ticker = ticker.strip().upper()
 
-    cached = _quote_cache.get(ticker)
-    if cached:
-        has_price = cached.get("price") is not None
-        has_change = cached.get("change") is not None
-        has_change_percent = cached.get("changePercent") is not None
-
-        if has_price and has_change and has_change_percent:
-            return cached
-
     t = yf.Ticker(ticker)
 
     price = None
     prev_close = None
     change = None
     change_pct = None
+
     currency = None
-    market_state = None
-    name = None
+    name = ticker
     exchange = None
     market = None
+    market_state = None
 
+    # ❌ Try fast_info (often fails on Render)
     try:
-        fast = t.fast_info
-        if fast:
-            price = (
-                fast.get("lastPrice")
-                or fast.get("last_price")
-                or fast.get("regularMarketPrice")
-            )
-            prev_close = (
-                fast.get("previousClose")
-                or fast.get("previous_close")
-            )
-            currency = fast.get("currency")
-            exchange = fast.get("exchange")
+        fast = t.fast_info or {}
+        price = fast.get("lastPrice") or fast.get("regularMarketPrice")
+        prev_close = fast.get("previousClose")
+        currency = fast.get("currency")
+        exchange = fast.get("exchange")
     except Exception:
-        logger.info("fast_info unavailable for ticker=%s, falling back", ticker)
+        pass
 
+    # ❌ Try info (often fails on Render)
     try:
         info = t.info or {}
 
         name = (
             info.get("shortName")
             or info.get("longName")
-            or info.get("displayName")
-            or info.get("name")
             or ticker
         )
 
-        exchange = (
-            exchange
-            or info.get("exchange")
-            or info.get("fullExchangeName")
-            or info.get("quoteExchange")
-        )
-
-        market = (
-            info.get("market")
-            or info.get("marketType")
-            or info.get("exchangeTimezoneName")
-        )
-
-        market_state = info.get("marketState")
+        exchange = exchange or info.get("exchange")
+        market = info.get("market")
         currency = currency or info.get("currency")
 
         if price is None:
-            price = (
-                info.get("regularMarketPrice")
-                or info.get("currentPrice")
-                or info.get("previousClose")
-            )
+            price = info.get("regularMarketPrice")
 
         if prev_close is None:
-            prev_close = (
-                info.get("regularMarketPreviousClose")
-                or info.get("previousClose")
-            )
+            prev_close = info.get("previousClose")
 
     except Exception:
-        logger.exception("Failed quote info fetch for ticker=%s", ticker)
+        pass
 
+    # 🔥 FORCE HISTORY FALLBACK (THIS FIXES EVERYTHING)
     try:
-        hist = _fetch_history_df(ticker, "5d", "1d", for_label="quote fallback")
-        if hist is not None and not hist.empty and "Close" in hist.columns:
-            closes = hist["Close"].dropna()
+        df = yf.download(ticker, period="5d", interval="1d", progress=False)
+
+        if df is not None and not df.empty:
+            closes = df["Close"].dropna()
 
             if len(closes) >= 2:
-                hist_price = float(closes.iloc[-1])
-                hist_prev_close = float(closes.iloc[-2])
-
-                price = hist_price
-                prev_close = hist_prev_close
-                change = hist_price - hist_prev_close
-                change_pct = (change / hist_prev_close) * 100 if hist_prev_close not in (None, 0) else None
+                price = float(closes.iloc[-1])
+                prev_close = float(closes.iloc[-2])
+                change = price - prev_close
+                change_pct = (change / prev_close) * 100 if prev_close != 0 else None
 
             elif len(closes) == 1:
-                hist_price = float(closes.iloc[-1])
-                price = hist_price if price is None else price
-                prev_close = hist_price if prev_close in (None, 0) else prev_close
-    except Exception:
-        logger.warning("History fallback failed for ticker=%s", ticker)
+                price = float(closes.iloc[-1])
+                prev_close = price
 
-    try:
-        if change is None and price is not None and prev_close not in (None, 0):
-            change = float(price) - float(prev_close)
-            change_pct = (change / float(prev_close)) * 100
     except Exception:
-        logger.warning("Failed change calculation for ticker=%s", ticker)
+        logger.exception("History fallback failed")
 
-    out = {
+    # compute change if still missing
+    if change is None and price is not None and prev_close not in (None, 0):
+        change = price - prev_close
+        change_pct = (change / prev_close) * 100
+
+    return {
         "symbol": ticker,
-        "name": name or ticker,
+        "name": name,
         "exchange": exchange,
         "market": market,
-        "currency": currency,
-        "price": _safe_float_or_none(price),
-        "change": _safe_float_or_none(change),
-        "changePercent": _safe_float_or_none(change_pct),
+        "currency": currency or ("INR" if ticker.endswith(".NS") else "USD"),
+        "price": price,
+        "change": change,
+        "changePercent": change_pct,
         "marketState": market_state,
         "asOf": _now_iso(),
     }
-
-    if (
-        out["price"] is not None
-        and out["change"] is not None
-        and out["changePercent"] is not None
-    ):
-        _quote_cache[ticker] = out
-
-    return out
 
 
 def get_company_profile(symbol: str) -> dict:
