@@ -9,6 +9,7 @@ from app.services.rag_ingest_service import CHROMA_DIR, COLLECTION_NAME
 
 
 def _get_client():
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     return chromadb.PersistentClient(path=str(CHROMA_DIR))
 
 
