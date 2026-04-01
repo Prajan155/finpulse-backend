@@ -26,7 +26,7 @@ def _iso(dt_like) -> str:
     return dt_like.isoformat()
 
 
-def _safe_float(value, default=0.0):
+def _safe_float(value, default=None):
     try:
         if value is None or pd.isna(value):
             return default
@@ -80,6 +80,43 @@ def _default_market_currency(ticker: str) -> tuple[str, str]:
     if ticker.endswith(".NS") or ticker.endswith(".BO"):
         return "India", "INR"
     return "US", "USD"
+
+
+def _is_valid_price(value) -> bool:
+    val = _safe_float_or_none(value)
+    return val is not None and val > 0
+
+
+def _safe_nonempty_str(*values):
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _extract_fast_value(fast, *keys):
+    if not fast:
+        return None
+    getter = getattr(fast, "get", None)
+    if callable(getter):
+        for key in keys:
+            try:
+                value = getter(key)
+            except Exception:
+                value = None
+            if value is not None:
+                return value
+    for key in keys:
+        try:
+            value = fast[key]
+        except Exception:
+            value = getattr(fast, key, None)
+        if value is not None:
+            return value
+    return None
 
 
 def _empty_quote(ticker: str) -> dict:
@@ -1183,21 +1220,76 @@ def get_quote(ticker: str) -> dict:
     market = market_default
     market_state = None
 
-    if _finnhub_enabled():
+    t = None
+    fast = {}
+
+    try:
+        t = yf.Ticker(ticker)
+    except Exception:
+        logger.info("Ticker init failed for ticker=%s", ticker)
+
+    if t is not None:
+        try:
+            fast = t.fast_info or {}
+        except Exception:
+            logger.info("fast_info unavailable for ticker=%s", ticker)
+
+        fast_price = _extract_fast_value(
+            fast,
+            "lastPrice",
+            "last_price",
+            "regularMarketPrice",
+            "previous_close",
+            "previousClose",
+        )
+        fast_prev_close = _extract_fast_value(fast, "previousClose", "previous_close")
+
+        if _is_valid_price(fast_price):
+            price = _safe_float_or_none(fast_price)
+            prev_close = _safe_float_or_none(fast_prev_close)
+
+        currency = (
+            _safe_nonempty_str(
+                _extract_fast_value(fast, "currency"),
+                currency,
+            )
+            or currency_default
+        )
+        exchange = _safe_nonempty_str(
+            _extract_fast_value(fast, "exchange"),
+            exchange,
+        )
+
+    if not _is_valid_price(price):
+        try:
+            hist = _fetch_history_df(ticker, "5d", "1d", for_label="quote daily fallback")
+
+            if hist is None or hist.empty or "Close" not in hist.columns:
+                hist = _fetch_history_df(ticker, "1mo", "1d", for_label="quote extended fallback")
+
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                closes = hist["Close"].dropna()
+
+                if len(closes) >= 2:
+                    price = _safe_float_or_none(closes.iloc[-1])
+                    prev_close = _safe_float_or_none(closes.iloc[-2])
+                elif len(closes) == 1:
+                    price = _safe_float_or_none(closes.iloc[-1])
+                    prev_close = _safe_float_or_none(closes.iloc[-1])
+        except Exception:
+            logger.exception("History-based quote fetch failed for ticker=%s", ticker)
+
+    if not _is_valid_price(price) and _finnhub_enabled():
         try:
             finnhub_q = _finnhub_quote(ticker)
             profile = _finnhub_company_profile(ticker)
 
-            if finnhub_q:
-                fh_price = finnhub_q.get("price")
-                fh_prev_close = finnhub_q.get("prevClose")
+            if finnhub_q and _is_valid_price(finnhub_q.get("price")):
+                price = _safe_float_or_none(finnhub_q.get("price"))
+                prev_close = _safe_float_or_none(finnhub_q.get("prevClose"))
+                change = _safe_float_or_none(finnhub_q.get("change"))
+                change_pct = _safe_float_or_none(finnhub_q.get("changePercent"))
 
-                # Accept Finnhub only if it returned a real usable price
-                if fh_price not in (None, 0, 0.0):
-                    price = fh_price
-                    prev_close = fh_prev_close
-                    change = finnhub_q.get("change")
-                    change_pct = finnhub_q.get("changePercent")
             if profile:
                 name = profile.get("name") or name
                 exchange = profile.get("exchange") or exchange
@@ -1207,50 +1299,47 @@ def get_quote(ticker: str) -> dict:
         except Exception:
             logger.exception("Finnhub quote/profile fetch failed for ticker=%s", ticker)
 
-    if price in (None, 0, 0.0):
+    if t is not None:
         try:
-            hist = _fetch_history_df(ticker, "5d", "1d", for_label="quote daily fallback")
+            info = t.info or {}
 
-            if hist is None or hist.empty or "Close" not in hist.columns:
-                hist = _fetch_history_df(ticker, "1d", "1m", for_label="quote intraday fallback")
+            if not _is_valid_price(price):
+                info_price = info.get("regularMarketPrice") or info.get("currentPrice")
+                if _is_valid_price(info_price):
+                    price = _safe_float_or_none(info_price)
 
-            if hist is not None and not hist.empty and "Close" in hist.columns:
-                closes = hist["Close"].dropna()
+            if prev_close is None:
+                prev_close = _safe_float_or_none(
+                    info.get("regularMarketPreviousClose") or info.get("previousClose")
+                )
 
-                if len(closes) >= 2:
-                    price = float(closes.iloc[-1])
-                    prev_close = float(closes.iloc[-2])
-                    change = price - prev_close
-                    change_pct = (change / prev_close) * 100 if prev_close else None
-                elif len(closes) == 1:
-                    price = float(closes.iloc[-1])
-                    prev_close = price
-        except Exception:
-            logger.exception("History-based quote fetch failed for ticker=%s", ticker)
-
-    if price in (None, 0, 0.0):
-        try:
-            t = yf.Ticker(ticker)
-            fast = t.fast_info or {}
-            price = (
-                fast.get("lastPrice")
-                or fast.get("last_price")
-                or fast.get("regularMarketPrice")
-                or price
+            name = (
+                info.get("shortName")
+                or info.get("longName")
+                or info.get("displayName")
+                or info.get("name")
+                or name
             )
-            prev_close = (
-                fast.get("previousClose")
-                or fast.get("previous_close")
-                or prev_close
+            exchange = (
+                exchange
+                or info.get("exchange")
+                or info.get("fullExchangeName")
+                or info.get("quoteExchange")
             )
-            currency = fast.get("currency") or currency
-            exchange = fast.get("exchange") or exchange
+            market = (
+                info.get("market")
+                or info.get("marketType")
+                or info.get("exchangeTimezoneName")
+                or market
+            )
+            currency = info.get("currency") or currency
+            market_state = info.get("marketState") or market_state
         except Exception:
-            logger.info("fast_info unavailable for ticker=%s", ticker)
+            logger.info("info unavailable for ticker=%s", ticker)
 
     try:
-        if profile is None:
-            profile = _finnhub_company_profile(ticker) if _finnhub_enabled() else None
+        if profile is None and _finnhub_enabled():
+            profile = _finnhub_company_profile(ticker)
         if profile:
             name = profile.get("name") or name
             exchange = profile.get("exchange") or exchange
@@ -1259,50 +1348,7 @@ def get_quote(ticker: str) -> dict:
     except Exception:
         logger.info("Finnhub profile unavailable for ticker=%s", ticker)
 
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
-        name = (
-            name
-            if name != ticker
-            else (
-                info.get("shortName")
-                or info.get("longName")
-                or info.get("displayName")
-                or info.get("name")
-                or ticker
-            )
-        )
-        exchange = (
-            exchange
-            or info.get("exchange")
-            or info.get("fullExchangeName")
-            or info.get("quoteExchange")
-        )
-        market = (
-            info.get("market")
-            or info.get("marketType")
-            or info.get("exchangeTimezoneName")
-            or market
-        )
-        currency = info.get("currency") or currency
-        market_state = info.get("marketState") or market_state
-
-        if price in (None, 0, 0.0):
-            price = (
-                info.get("regularMarketPrice")
-                or info.get("currentPrice")
-                or info.get("previousClose")
-            )
-        if prev_close is None:
-            prev_close = (
-                info.get("regularMarketPreviousClose")
-                or info.get("previousClose")
-            )
-    except Exception:
-        logger.info("info unavailable for ticker=%s", ticker)
-
-    if change is None and price is not None and prev_close not in (None, 0):
+    if change is None and _is_valid_price(price) and prev_close not in (None, 0):
         try:
             change = float(price) - float(prev_close)
             change_pct = (change / float(prev_close)) * 100

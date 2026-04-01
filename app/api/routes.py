@@ -52,6 +52,7 @@ from app.services.yahoo_service import (
     get_quote,
     get_quotes_batch,
     get_ratios,
+    get_revenue_expenses,
     search_symbols,
 )
 
@@ -62,7 +63,7 @@ router.include_router(watchlist_router)
 router.include_router(portfolio_storage_router)
 
 
-def _safe_num(value, default=None):
+def _safe_num(value, default=0.0):
     try:
         if value is None:
             return default
@@ -286,67 +287,22 @@ def correlation(
 
 @router.get("/stocks/{symbol}/revenue-expenses", response_model=RevenueExpensesOut)
 def revenue_expenses(symbol: str, frequency: str = "quarterly"):
-    import yfinance as yf
+    result = get_revenue_expenses(symbol, frequency=frequency)
 
-    ticker = yf.Ticker(symbol)
-
-    try:
-        financials = (
-            ticker.quarterly_financials
-            if frequency == "quarterly"
-            else ticker.financials
-        )
-
-        if financials is None or financials.empty:
-            return {
-                "symbol": symbol.upper(),
-                "frequency": frequency,
-                "points": [],
+    return {
+        "symbol": result.get("symbol", symbol.upper()),
+        "frequency": frequency,
+        "points": [
+            {
+                "date": p.get("period") or p.get("date"),
+                "revenue": p.get("revenue"),
+                "expenses": p.get("expenses"),
             }
-
-        points = []
-
-        revenue_row = (
-            financials.loc["Total Revenue"]
-            if "Total Revenue" in financials.index
-            else None
-        )
-        expenses_row = (
-            financials.loc["Total Expenses"]
-            if "Total Expenses" in financials.index
-            else None
-        )
-        gross_profit_row = (
-            financials.loc["Gross Profit"]
-            if "Gross Profit" in financials.index
-            else None
-        )
-
-        for date in financials.columns:
-            revenue = revenue_row.get(date) if revenue_row is not None else None
-            expenses = expenses_row.get(date) if expenses_row is not None else None
-
-            if expenses is None and revenue is not None and gross_profit_row is not None:
-                gross_profit = gross_profit_row.get(date)
-                if gross_profit is not None:
-                    expenses = revenue - gross_profit
-
-            points.append(
-                {
-                    "date": str(date.date()),
-                    "revenue": float(revenue) if revenue is not None else 0,
-                    "expenses": float(expenses) if expenses is not None else 0,
-                }
-            )
-
-        return {
-            "symbol": symbol.upper(),
-            "frequency": frequency,
-            "points": sorted(points, key=lambda x: x["date"]),
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            for p in result.get("points", [])
+            if p.get("period") or p.get("date")
+        ],
+        "currency": result.get("currency"),
+    }
 
 
 @router.get("/stocks", response_model=list[StockOut])
