@@ -43,8 +43,7 @@ def get_stock_overview(symbol: str) -> dict:
     profile = get_company_profile(symbol) or {}
 
     price = quote.get("price")
-    has_live_price = price not in (None, 0, 0.0)
-
+    has_live_price = price is not None
     ratios = get_ratios(symbol) if has_live_price else {
         "symbol": symbol,
         "market_cap": profile.get("market_cap"),

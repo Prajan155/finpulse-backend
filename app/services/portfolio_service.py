@@ -13,7 +13,7 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def _safe_float(value, default: float = 0.0) -> float:
+def _safe_float(value, default: float | None = None):
     try:
         if value is None:
             return default

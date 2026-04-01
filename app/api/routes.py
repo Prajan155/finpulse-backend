@@ -62,7 +62,7 @@ router.include_router(watchlist_router)
 router.include_router(portfolio_storage_router)
 
 
-def _safe_num(value, default=0.0):
+def _safe_num(value, default=None):
     try:
         if value is None:
             return default
