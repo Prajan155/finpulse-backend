@@ -48,7 +48,7 @@ def _normalize_weights(positions: List[dict]) -> List[dict]:
             p.get("avg_buy_price", p.get("average_price")),
             0.0,
         )
-        explicit_weight = _safe_float(p.get("weight"), 0.0)
+        explicit_weight = _safe_float(p.get("weight") or 0.0)
 
         if symbol not in merged:
             merged[symbol] = {
@@ -447,9 +447,9 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
         sector = profile.get("sector") or "Unknown"
         regime = rec.get("regime", "balanced")
 
-        current_price = _safe_float(rec.get("current_price"), 0.0)
-        target_price = _safe_float(rec.get("target_price"), 0.0)
-        upside_percent = _safe_float(rec.get("upside_percent"), 0.0)
+        current_price = _safe_float(rec.get("current_price") or 0.0)
+        target_price = _safe_float(rec.get("target_price") or 0.0)
+        upside_percent = _safe_float(rec.get("upside_percent") or 0.0)
 
         target_weight = (
             raw_targets[symbol] / total_positive if total_positive > 0 else current_weight
@@ -483,9 +483,9 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
         if invested_value <= 0:
             invested_value = shares * current_price
 
-        current_value = shares * current_price
+        current_value = shares * (current_price or 0)
         gain_loss = current_value - invested_value
-        return_percent = (gain_loss / invested_value) * 100 if invested_value > 0 else 0.0
+        return_percent = (gain_loss / invested_value) * 100 if invested_value and invested_value > 0 else None
 
         holdings.append(
             {
