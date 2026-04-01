@@ -9,7 +9,13 @@ router = APIRouter()
 
 @router.post("/chat", response_model=FirePulseResponse)
 def firepulse_chat(payload: FirePulseRequest):
-    return answer_firepulse(payload.question, payload.symbol)
+    return answer_firepulse(
+        question=payload.question,
+        symbol=payload.symbol,
+        compare_symbols=payload.compare_symbols,
+        portfolio=payload.portfolio,
+        watchlist=payload.watchlist,
+    )
 
 
 @router.post("/reindex")

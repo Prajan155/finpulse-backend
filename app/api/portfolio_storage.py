@@ -14,20 +14,6 @@ from app.schemas.portfolio_storage import (
 router = APIRouter(prefix="/portfolio", tags=["portfolio-storage"])
 
 
-@router.get("/holdings", response_model=list[PortfolioHoldingOut])
-def get_holdings(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    holdings = (
-        db.query(PortfolioHolding)
-        .filter(PortfolioHolding.user_id == current_user.id)
-        .order_by(PortfolioHolding.id.desc())
-        .all()
-    )
-    return holdings
-
-
 @router.post("/holdings", response_model=PortfolioHoldingOut)
 def add_holding(
     payload: PortfolioHoldingCreate,

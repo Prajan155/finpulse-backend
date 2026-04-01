@@ -26,14 +26,7 @@ def get_indicator_data(db: Session, symbol: str, limit: int = 300):
     df = df.dropna(subset=["close"]).copy()
     if df.empty:
         return [
-            {
-                 "date": r["date"].isoformat(),
-                 "close": round(float(r["close"]), 2) if r["close"] else None,
-                 "sma_20": round(float(r["sma_20"]), 2) if r["sma_20"] else None,
-                 "ema_20": round(float(r["ema_20"]), 2) if r["ema_20"] else None,
-                 "rsi_14": round(float(r["rsi_14"]), 2) if r["rsi_14"] else None,
-            }
-            for _, r in df.tail(200).iterrows()]
+          ]
 
     df["close"] = df["close"].astype(float)
 

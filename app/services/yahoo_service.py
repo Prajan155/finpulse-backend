@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
+import time
 
+import requests
 from cachetools import TTLCache
 import yfinance as yf
 import pandas as pd
@@ -133,8 +136,24 @@ def _fetch_history_df(
     *,
     for_label: str = "history",
 ) -> pd.DataFrame | None:
-    t = yf.Ticker(ticker)
     df = None
+
+    if _finnhub_enabled():
+        try:
+            df = _finnhub_fetch_candles(ticker, period, interval)
+        except Exception:
+            logger.exception(
+                "Finnhub %s fetch failed for ticker=%s interval=%s period=%s",
+                for_label,
+                ticker,
+                interval,
+                period,
+            )
+
+    if df is not None and not df.empty:
+        return _normalize_download_df(df)
+
+    t = yf.Ticker(ticker)
 
     try:
         df = t.history(
@@ -145,7 +164,7 @@ def _fetch_history_df(
         )
     except Exception:
         logger.exception(
-            "Primary %s fetch failed for ticker=%s interval=%s period=%s",
+            "yfinance primary %s fetch failed for ticker=%s interval=%s period=%s",
             for_label,
             ticker,
             interval,
@@ -166,7 +185,7 @@ def _fetch_history_df(
             )
         except Exception:
             logger.exception(
-                "Fallback %s download failed for ticker=%s interval=%s period=%s",
+                "yfinance fallback %s download failed for ticker=%s interval=%s period=%s",
                 for_label,
                 ticker,
                 interval,
@@ -177,6 +196,255 @@ def _fetch_history_df(
     df = _normalize_download_df(df)
     return df
 
+
+
+
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
+_FINNHUB_TIMEOUT = 12
+_FINNHUB_SESSION = requests.Session()
+_finnhub_symbol_cache = TTLCache(maxsize=5000, ttl=86400)
+
+
+def _get_finnhub_api_key() -> str | None:
+    return (
+        os.getenv("FINNHUB_API_KEY")
+        or os.getenv("FINNHUB_TOKEN")
+        or os.getenv("FINNHUB_KEY")
+    )
+
+
+def _finnhub_enabled() -> bool:
+    return bool(_get_finnhub_api_key())
+
+
+def _to_finnhub_symbol(symbol: str) -> str:
+    symbol = (symbol or "").upper().strip()
+    if not symbol:
+        return symbol
+    if ":" in symbol:
+        return symbol
+    if symbol.endswith(".NS"):
+        return f"NSE:{symbol[:-3]}"
+    if symbol.endswith(".BO"):
+        return f"BSE:{symbol[:-3]}"
+    return symbol
+
+
+def _from_finnhub_symbol(symbol: str) -> str:
+    symbol = (symbol or "").upper().strip()
+    if symbol.startswith("NSE:"):
+        return f"{symbol.split(':', 1)[1]}.NS"
+    if symbol.startswith("BSE:"):
+        return f"{symbol.split(':', 1)[1]}.BO"
+    return symbol
+
+
+def _finnhub_resolution(interval: str) -> str | None:
+    interval = (interval or "").lower().strip()
+    mapping = {
+        "1m": "1",
+        "5m": "5",
+        "15m": "15",
+        "30m": "30",
+        "60m": "60",
+        "90m": "60",
+        "1h": "60",
+        "1d": "D",
+        "1wk": "W",
+        "1mo": "M",
+    }
+    return mapping.get(interval)
+
+
+def _range_to_timestamps(range_: str) -> tuple[int, int]:
+    now = int(time.time())
+    value = (range_ or "6mo").strip().lower()
+
+    seconds_map = {
+        "1d": 86400,
+        "5d": 5 * 86400,
+        "7d": 7 * 86400,
+        "1mo": 31 * 86400,
+        "3mo": 92 * 86400,
+        "6mo": 183 * 86400,
+        "1y": 366 * 86400,
+        "2y": 732 * 86400,
+        "5y": 5 * 366 * 86400,
+        "10y": 10 * 366 * 86400,
+        "ytd": 120 * 86400,
+        "max": 20 * 366 * 86400,
+    }
+    delta = seconds_map.get(value, 183 * 86400)
+    return now - delta, now
+
+
+def _finnhub_request(path: str, params: dict | None = None) -> dict | list | None:
+    api_key = _get_finnhub_api_key()
+    if not api_key:
+        return None
+
+    payload = dict(params or {})
+    payload["token"] = api_key
+
+    try:
+        resp = _FINNHUB_SESSION.get(
+            f"{FINNHUB_BASE_URL}{path}",
+            params=payload,
+            timeout=_FINNHUB_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        logger.exception("Finnhub request failed for path=%s params=%s", path, params)
+        return None
+
+
+def _infer_market_from_exchange(exchange: str | None, symbol: str) -> str:
+    exchange_upper = (exchange or "").upper()
+    if symbol.endswith(".NS") or "NSE" in exchange_upper:
+        return "India"
+    if symbol.endswith(".BO") or "BSE" in exchange_upper:
+        return "India"
+    return "US"
+
+
+def _finnhub_fetch_candles(symbol: str, period: str, interval: str) -> pd.DataFrame | None:
+    finnhub_symbol = _to_finnhub_symbol(symbol)
+    resolution = _finnhub_resolution(interval)
+    if not resolution:
+        return None
+
+    start_ts, end_ts = _range_to_timestamps(period)
+    data = _finnhub_request(
+        "/stock/candle",
+        {
+            "symbol": finnhub_symbol,
+            "resolution": resolution,
+            "from": start_ts,
+            "to": end_ts,
+        },
+    )
+
+    if not isinstance(data, dict) or data.get("s") != "ok":
+        return None
+
+    timestamps = data.get("t") or []
+    if not timestamps:
+        return None
+
+    df = pd.DataFrame(
+        {
+            "Open": data.get("o") or [],
+            "High": data.get("h") or [],
+            "Low": data.get("l") or [],
+            "Close": data.get("c") or [],
+            "Volume": data.get("v") or [],
+        },
+        index=pd.to_datetime(timestamps, unit="s", utc=True),
+    )
+    return df if not df.empty else None
+
+
+def _finnhub_search_symbols(q: str, market: str = "ALL", limit: int = 10) -> list[dict]:
+    data = _finnhub_request("/search", {"q": q})
+    if not isinstance(data, dict):
+        return []
+
+    market = (market or "ALL").upper().strip()
+    out = []
+
+    for item in data.get("result") or []:
+        raw_symbol = (item.get("symbol") or "").upper().strip()
+        description = item.get("description") or ""
+        display_symbol = (item.get("displaySymbol") or raw_symbol).upper().strip()
+
+        if not raw_symbol:
+            continue
+
+        app_symbol = _from_finnhub_symbol(raw_symbol)
+        exchange = raw_symbol.split(":", 1)[0] if ":" in raw_symbol else item.get("mic") or "Unknown"
+
+        if market == "NSE" and not app_symbol.endswith(".NS"):
+            continue
+        if market == "BSE" and not app_symbol.endswith(".BO"):
+            continue
+        if market == "US" and (app_symbol.endswith(".NS") or app_symbol.endswith(".BO")):
+            continue
+
+        _, currency = _default_market_currency(app_symbol)
+        out.append(
+            {
+                "symbol": app_symbol,
+                "name": description or display_symbol or app_symbol,
+                "exchange": exchange,
+                "market": exchange if market == "ALL" else market,
+                "currency": currency,
+            }
+        )
+        if len(out) >= limit:
+            break
+
+    return out
+
+
+def _finnhub_quote(symbol: str) -> dict | None:
+    finnhub_symbol = _to_finnhub_symbol(symbol)
+    data = _finnhub_request("/quote", {"symbol": finnhub_symbol})
+    if not isinstance(data, dict):
+        return None
+
+    current = _safe_float_or_none(data.get("c"))
+    previous_close = _safe_float_or_none(data.get("pc"))
+    if current is None:
+        return None
+
+    change = _safe_float_or_none(data.get("d"))
+    change_percent = _safe_float_or_none(data.get("dp"))
+    if change is None and previous_close is not None:
+        change = current - previous_close
+    if change_percent is None and previous_close not in (None, 0):
+        change_percent = ((current - previous_close) / previous_close) * 100
+
+    return {
+        "price": current,
+        "change": change,
+        "changePercent": change_percent,
+        "prevClose": previous_close,
+        "high": _safe_float_or_none(data.get("h")),
+        "low": _safe_float_or_none(data.get("l")),
+        "open": _safe_float_or_none(data.get("o")),
+        "timestamp": data.get("t"),
+    }
+
+
+def _finnhub_company_profile(symbol: str) -> dict | None:
+    finnhub_symbol = _to_finnhub_symbol(symbol)
+    profile = _finnhub_request("/stock/profile2", {"symbol": finnhub_symbol})
+    if not isinstance(profile, dict) or not profile:
+        return None
+
+    return {
+        "symbol": symbol,
+        "name": profile.get("name") or symbol,
+        "exchange": profile.get("exchange"),
+        "currency": profile.get("currency"),
+        "country": profile.get("country"),
+        "industry": profile.get("finnhubIndustry") or "",
+        "ipo": profile.get("ipo"),
+        "market_cap": _safe_float_or_none(profile.get("marketCapitalization")),
+        "weburl": profile.get("weburl"),
+    }
+
+
+def _finnhub_basic_financials(symbol: str) -> dict | None:
+    finnhub_symbol = _to_finnhub_symbol(symbol)
+    data = _finnhub_request("/stock/metric", {"symbol": finnhub_symbol, "metric": "all"})
+    if not isinstance(data, dict):
+        return None
+    metric = data.get("metric")
+    if not isinstance(metric, dict) or not metric:
+        return None
+    return metric
 
 def _prepare_series_for_arima(series: pd.Series, freq: str) -> pd.Series:
     s = series.dropna().copy()
@@ -194,6 +462,14 @@ def search_symbols(q: str, market: str = "ALL", limit: int = 10) -> dict:
 
     if not q:
         return {"query": q, "results": []}
+
+    if _finnhub_enabled():
+        try:
+            results = _finnhub_search_symbols(q, market=market, limit=limit)
+            if results:
+                return {"query": q, "results": results}
+        except Exception:
+            logger.exception("Finnhub symbol search failed for query=%s market=%s", q, market)
 
     results = []
 
@@ -275,6 +551,98 @@ def get_history(ticker: str, interval: str = "1d", range_: str = "6mo") -> dict:
 @ttl_cache(prefix="ratios", ttl_seconds=1800)
 def get_ratios(ticker: str) -> dict:
     ticker = ticker.strip().upper()
+    default = _empty_ratios(ticker)
+
+    def _to_percent(value):
+        val = _safe_float_or_none(value)
+        if val is None:
+            return None
+        if -1 <= val <= 1:
+            val = val * 100
+        return val
+
+    finnhub_profile = None
+    finnhub_metric = None
+
+    if _finnhub_enabled():
+        try:
+            finnhub_profile = _finnhub_company_profile(ticker)
+            finnhub_metric = _finnhub_basic_financials(ticker)
+            if finnhub_metric:
+                market_cap = None
+                if finnhub_profile:
+                    market_cap = _safe_float_or_none(finnhub_profile.get("market_cap"))
+                    if market_cap is not None and market_cap < 1_000_000:
+                        market_cap *= 1_000_000
+
+                out = {
+                    "symbol": ticker,
+                    "market_cap": _round_or_none(market_cap, 4),
+                    "pe_ttm": _round_or_none(finnhub_metric.get("peTTM"), 4),
+                    "pb": _round_or_none(
+                        finnhub_metric.get("pbQuarterly") or finnhub_metric.get("pbAnnual"),
+                        4,
+                    ),
+                    "ps_ttm": _round_or_none(finnhub_metric.get("psTTM"), 4),
+                    "dividend_yield": _round_or_none(
+                        _to_percent(
+                            finnhub_metric.get("dividendYieldIndicatedAnnual")
+                            or finnhub_metric.get("currentDividendYieldTTM")
+                        ),
+                        4,
+                    ),
+                    "beta": _round_or_none(finnhub_metric.get("beta"), 4),
+                    "profit_margin": _round_or_none(
+                        _to_percent(
+                            finnhub_metric.get("netMarginTTM")
+                            or finnhub_metric.get("netProfitMarginAnnual")
+                        ),
+                        4,
+                    ),
+                    "operating_margin": _round_or_none(
+                        _to_percent(
+                            finnhub_metric.get("operatingMarginTTM")
+                            or finnhub_metric.get("operatingMarginAnnual")
+                        ),
+                        4,
+                    ),
+                    "roe": _round_or_none(
+                        _to_percent(
+                            finnhub_metric.get("roeTTM")
+                            or finnhub_metric.get("roeAnnual")
+                        ),
+                        4,
+                    ),
+                    "roa": _round_or_none(
+                        _to_percent(
+                            finnhub_metric.get("roaTTM")
+                            or finnhub_metric.get("roaAnnual")
+                        ),
+                        4,
+                    ),
+                    "debt_to_equity": _round_or_none(
+                        finnhub_metric.get("totalDebt/totalEquityQuarterly")
+                        or finnhub_metric.get("totalDebt/totalEquityAnnual")
+                        or finnhub_metric.get("totalDebtToEquityQuarterly")
+                        or finnhub_metric.get("totalDebtToEquityAnnual"),
+                        4,
+                    ),
+                    "current_ratio": _round_or_none(
+                        finnhub_metric.get("currentRatioQuarterly")
+                        or finnhub_metric.get("currentRatioAnnual"),
+                        4,
+                    ),
+                    "quick_ratio": _round_or_none(
+                        finnhub_metric.get("quickRatioQuarterly")
+                        or finnhub_metric.get("quickRatioAnnual"),
+                        4,
+                    ),
+                }
+                if any(v is not None for k, v in out.items() if k != "symbol"):
+                    return out
+        except Exception:
+            logger.exception("Finnhub ratios fetch failed for ticker=%s", ticker)
+
     t = yf.Ticker(ticker)
 
     info = {}
@@ -289,16 +657,6 @@ def get_ratios(ticker: str) -> dict:
         info = t.info or {}
     except Exception:
         logger.warning("info fetch failed for %s", ticker)
-
-    def _to_percent(value):
-        val = _safe_float_or_none(value)
-        if val is None:
-            return None
-        if -1 <= val <= 1:
-            val = val * 100
-        if val < 0:
-            return None
-        return val
 
     market_cap = _safe_float_or_none(info.get("marketCap") or fast.get("market_cap"))
     pe_ttm = _safe_float_or_none(info.get("trailingPE") or info.get("forwardPE"))
@@ -813,6 +1171,7 @@ def get_quote(ticker: str) -> dict:
         return cached
 
     market_default, currency_default = _default_market_currency(ticker)
+    profile = None
 
     price = None
     prev_close = None
@@ -824,27 +1183,52 @@ def get_quote(ticker: str) -> dict:
     market = market_default
     market_state = None
 
-    try:
-        hist = _fetch_history_df(ticker, "5d", "1d", for_label="quote daily fallback")
+    if _finnhub_enabled():
+        try:
+            finnhub_q = _finnhub_quote(ticker)
+            profile = _finnhub_company_profile(ticker)
 
-        if hist is None or hist.empty or "Close" not in hist.columns:
-            hist = _fetch_history_df(ticker, "1d", "1m", for_label="quote intraday fallback")
+            if finnhub_q:
+                fh_price = finnhub_q.get("price")
+                fh_prev_close = finnhub_q.get("prevClose")
 
-        if hist is not None and not hist.empty and "Close" in hist.columns:
-            closes = hist["Close"].dropna()
+                # Accept Finnhub only if it returned a real usable price
+                if fh_price not in (None, 0, 0.0):
+                    price = fh_price
+                    prev_close = fh_prev_close
+                    change = finnhub_q.get("change")
+                    change_pct = finnhub_q.get("changePercent")
+            if profile:
+                name = profile.get("name") or name
+                exchange = profile.get("exchange") or exchange
+                currency = profile.get("currency") or currency
+                market = _infer_market_from_exchange(exchange, ticker)
+                market_state = "REGULAR"
+        except Exception:
+            logger.exception("Finnhub quote/profile fetch failed for ticker=%s", ticker)
 
-            if len(closes) >= 2:
-                price = float(closes.iloc[-1])
-                prev_close = float(closes.iloc[-2])
-                change = price - prev_close
-                change_pct = (change / prev_close) * 100 if prev_close else None
-            elif len(closes) == 1:
-                price = float(closes.iloc[-1])
-                prev_close = price
-    except Exception:
-        logger.exception("History-based quote fetch failed for ticker=%s", ticker)
+    if price in (None, 0, 0.0):
+        try:
+            hist = _fetch_history_df(ticker, "5d", "1d", for_label="quote daily fallback")
 
-    if price is None:
+            if hist is None or hist.empty or "Close" not in hist.columns:
+                hist = _fetch_history_df(ticker, "1d", "1m", for_label="quote intraday fallback")
+
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                closes = hist["Close"].dropna()
+
+                if len(closes) >= 2:
+                    price = float(closes.iloc[-1])
+                    prev_close = float(closes.iloc[-2])
+                    change = price - prev_close
+                    change_pct = (change / prev_close) * 100 if prev_close else None
+                elif len(closes) == 1:
+                    price = float(closes.iloc[-1])
+                    prev_close = price
+        except Exception:
+            logger.exception("History-based quote fetch failed for ticker=%s", ticker)
+
+    if price in (None, 0, 0.0):
         try:
             t = yf.Ticker(ticker)
             fast = t.fast_info or {}
@@ -864,45 +1248,59 @@ def get_quote(ticker: str) -> dict:
         except Exception:
             logger.info("fast_info unavailable for ticker=%s", ticker)
 
-    if price is None:
-        try:
-            t = yf.Ticker(ticker)
-            info = t.info or {}
-            name = (
+    try:
+        if profile is None:
+            profile = _finnhub_company_profile(ticker) if _finnhub_enabled() else None
+        if profile:
+            name = profile.get("name") or name
+            exchange = profile.get("exchange") or exchange
+            currency = profile.get("currency") or currency
+            market = _infer_market_from_exchange(exchange, ticker)
+    except Exception:
+        logger.info("Finnhub profile unavailable for ticker=%s", ticker)
+
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+        name = (
+            name
+            if name != ticker
+            else (
                 info.get("shortName")
                 or info.get("longName")
                 or info.get("displayName")
                 or info.get("name")
                 or ticker
             )
-            exchange = (
-                exchange
-                or info.get("exchange")
-                or info.get("fullExchangeName")
-                or info.get("quoteExchange")
-            )
-            market = (
-                info.get("market")
-                or info.get("marketType")
-                or info.get("exchangeTimezoneName")
-                or market
-            )
-            currency = info.get("currency") or currency
-            market_state = info.get("marketState")
+        )
+        exchange = (
+            exchange
+            or info.get("exchange")
+            or info.get("fullExchangeName")
+            or info.get("quoteExchange")
+        )
+        market = (
+            info.get("market")
+            or info.get("marketType")
+            or info.get("exchangeTimezoneName")
+            or market
+        )
+        currency = info.get("currency") or currency
+        market_state = info.get("marketState") or market_state
 
-            if price is None:
-                price = (
-                    info.get("regularMarketPrice")
-                    or info.get("currentPrice")
-                    or info.get("previousClose")
-                )
-            if prev_close is None:
-                prev_close = (
-                    info.get("regularMarketPreviousClose")
-                    or info.get("previousClose")
-                )
-        except Exception:
-            logger.info("info unavailable for ticker=%s", ticker)
+        if price in (None, 0, 0.0):
+            price = (
+                info.get("regularMarketPrice")
+                or info.get("currentPrice")
+                or info.get("previousClose")
+            )
+        if prev_close is None:
+            prev_close = (
+                info.get("regularMarketPreviousClose")
+                or info.get("previousClose")
+            )
+    except Exception:
+        logger.info("info unavailable for ticker=%s", ticker)
 
     if change is None and price is not None and prev_close not in (None, 0):
         try:
@@ -938,6 +1336,25 @@ def get_company_profile(symbol: str) -> dict:
         return cached
 
     fallback = _empty_profile(symbol)
+
+    if _finnhub_enabled():
+        try:
+            profile = _finnhub_company_profile(symbol)
+            if profile:
+                out = {
+                    "symbol": symbol,
+                    "sector": "",
+                    "industry": profile.get("industry") or "",
+                    "market_cap": _safe_float_or_none(profile.get("market_cap")),
+                    "currency": profile.get("currency") or fallback["currency"],
+                    "summary": "",
+                }
+                if out["market_cap"] is not None and out["market_cap"] < 1_000_000:
+                    out["market_cap"] *= 1_000_000
+                _profile_cache[symbol] = out
+                return out
+        except Exception:
+            logger.exception("Finnhub company profile fetch failed for symbol=%s", symbol)
 
     try:
         ticker = yf.Ticker(symbol)

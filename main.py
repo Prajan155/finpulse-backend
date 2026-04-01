@@ -12,6 +12,7 @@ from app.core.exceptions import register_exception_handlers
 from app.core.init_db import init_db
 from app.core.middleware import log_requests_middleware
 from app.api.firepulse import router as firepulse_router
+from app.services.scheduler_service import start_scheduler
 
 app = FastAPI(
     title=settings.app_name,
@@ -25,6 +26,7 @@ app = FastAPI(
 @app.on_event("startup")
 def on_startup():
     init_db()
+    start_scheduler()
 
 
 limiter = Limiter(key_func=get_remote_address)
@@ -39,7 +41,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "http://localhost:8000",
+        "http://127.0.0.1:8000",
         "https://finpulse-nexus.vercel.app",
     ],
     allow_credentials=True,

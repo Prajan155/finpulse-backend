@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+from app.services.recommendation_service import get_stock_recommendation
 from app.services.yahoo_service import (
+    get_company_profile,
+    get_long_range_forecast_arima,
     get_quote,
     get_ratios,
     get_revenue_expenses,
-    get_long_range_forecast_arima,
-    get_company_profile,
 )
-from app.services.recommendation_service import get_stock_recommendation
 
 
 def _fallback_recommendation(symbol: str, price: float | None) -> dict:
@@ -39,33 +39,37 @@ def _fallback_recommendation(symbol: str, price: float | None) -> dict:
 def get_stock_overview(symbol: str) -> dict:
     symbol = symbol.upper().strip()
 
-    quote = get_quote(symbol)
+    quote = get_quote(symbol) or {}
+    profile = get_company_profile(symbol) or {}
+
     price = quote.get("price")
+    has_live_price = price not in (None, 0, 0.0)
 
-    # Always keep overview light when quote data is missing.
-    # This avoids hammering Yahoo with many expensive follow-up requests.
-    profile = get_company_profile(symbol)
+    ratios = get_ratios(symbol) if has_live_price else {
+        "symbol": symbol,
+        "market_cap": profile.get("market_cap"),
+        "pe_ttm": None,
+        "pb": None,
+        "ps_ttm": None,
+        "dividend_yield": None,
+        "beta": None,
+        "profit_margin": None,
+        "operating_margin": None,
+        "roe": None,
+        "roa": None,
+        "debt_to_equity": None,
+        "current_ratio": None,
+        "quick_ratio": None,
+    }
 
-    if price is None:
-        ratios = {
-            "symbol": symbol,
-            "market_cap": profile.get("market_cap"),
-            "pe_ttm": None,
-            "pb": None,
-            "ps_ttm": None,
-            "dividend_yield": None,
-            "beta": None,
-            "profit_margin": None,
-            "operating_margin": None,
-            "roe": None,
-            "roa": None,
-            "debt_to_equity": None,
-            "current_ratio": None,
-            "quick_ratio": None,
-        }
+    recommendation = (
+        get_stock_recommendation(symbol) if has_live_price else _fallback_recommendation(symbol, price)
+    )
 
-        recommendation = _fallback_recommendation(symbol, price)
-        forecast = {
+    forecast = (
+        get_long_range_forecast_arima(symbol, horizon_days=30, interval="1d")
+        if has_live_price
+        else {
             "symbol": symbol,
             "model": "ARIMA",
             "interval": "1d",
@@ -75,16 +79,17 @@ def get_stock_overview(symbol: str) -> dict:
             "error": "Live history data unavailable",
             "points": [],
         }
-        revenue_expenses = {
+    )
+
+    revenue_expenses = (
+        get_revenue_expenses(symbol, frequency="quarterly")
+        if has_live_price
+        else {
             "symbol": symbol,
             "points": [],
             "currency": profile.get("currency") or quote.get("currency") or "",
         }
-    else:
-        ratios = get_ratios(symbol)
-        recommendation = get_stock_recommendation(symbol)
-        forecast = get_long_range_forecast_arima(symbol, horizon_days=30, interval="1d")
-        revenue_expenses = get_revenue_expenses(symbol, frequency="quarterly")
+    )
 
     return {
         "symbol": symbol,

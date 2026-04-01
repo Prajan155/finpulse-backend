@@ -28,15 +28,27 @@ def _to_int(x):
 
 
 def refresh_price_history(db: Session, symbol: str, period: str = "1y", interval: str = "1d"):
+    from app.services.yahoo_service import _finnhub_enabled, _finnhub_fetch_candles
+
     symbol = symbol.upper().strip()
 
-    df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
+    df = None
+
+    # ✅ Try Finnhub first
+    if _finnhub_enabled():
+        try:
+            df = _finnhub_fetch_candles(symbol, period, interval)
+        except Exception:
+            pass
+
+    # ✅ Fallback to yfinance
+    if df is None or df.empty:
+        df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
 
     if df is None or df.empty:
         return 0
 
     df = df.reset_index()
-    # Drop duplicate column names (prevents row["Open"] returning a Series)
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
     # detect datetime column
@@ -52,12 +64,13 @@ def refresh_price_history(db: Session, symbol: str, period: str = "1y", interval
     for _, row in df.iterrows():
         raw_dt = row[dt_col]
 
-        # If we accidentally got a Series (e.g., duplicate column name), take the first value
         if isinstance(raw_dt, pd.Series):
             raw_dt = raw_dt.iloc[0]
+
         dt = pd.to_datetime(raw_dt, errors="coerce")
         if pd.isna(dt):
             continue
+
         d: date = dt.date()
 
         existing = (
@@ -67,12 +80,12 @@ def refresh_price_history(db: Session, symbol: str, period: str = "1y", interval
         )
 
         def clean(x):
-            # If we somehow still get a Series, take the first value
             if isinstance(x, pd.Series):
                 x = x.iloc[0]
             if x is None or pd.isna(x):
                 return None
             return float(x)
+
         def clean_int(x):
             if isinstance(x, pd.Series):
                 x = x.iloc[0]
@@ -88,6 +101,7 @@ def refresh_price_history(db: Session, symbol: str, period: str = "1y", interval
         l = clean(row.get("Low"))
         c = clean(row.get("Close"))
         v = clean_int(row.get("Volume"))
+
         if existing:
             existing.open = o
             existing.high = h

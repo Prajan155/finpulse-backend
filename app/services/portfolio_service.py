@@ -338,8 +338,15 @@ def _build_base_portfolio_context(norm_positions: List[dict]) -> Dict:
 
     if len(unique_symbols) >= 2:
         try:
-            corr = get_correlation_matrix(unique_symbols, range_="6mo")
-            matrix = corr.get("matrix", []) or []
+            try:
+                corr = get_correlation_matrix(unique_symbols, range_="6mo")
+                matrix = corr.get("matrix", []) or []
+
+                if not matrix or all(all(v is None for v in row) for row in matrix):
+                    raise Exception("Invalid correlation data")
+
+            except Exception:
+                matrix = []
             avg_corr = _avg_offdiag_corr(matrix)
             diversification_score = round(_clamp(1.0 - avg_corr, 0.0, 1.0), 2)
 

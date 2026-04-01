@@ -2,21 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Dict, List
+
 import chromadb
-import os
 
 from app.services.gemini_service import embed_texts
 
-# ✅ Render-safe paths
 CHROMA_DIR = Path(os.getenv("CHROMA_DIR", "/tmp/chroma"))
 KNOWLEDGE_DIR = Path(os.getenv("KNOWLEDGE_DIR", "/tmp/knowledge"))
 COLLECTION_NAME = "firepulse_knowledge"
 
 
 def _get_client():
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)  # 🔥 IMPORTANT
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     return chromadb.PersistentClient(path=str(CHROMA_DIR))
 
 
@@ -70,9 +70,8 @@ def _read_file(path: Path) -> str:
         if path.suffix.lower() == ".json":
             data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
             return json.dumps(data, indent=2)
-
-    except Exception as e:
-        print("File read error:", path, e)
+    except Exception as exc:
+        print("File read error:", path, exc)
 
     return ""
 
@@ -100,7 +99,9 @@ def ingest_knowledge_base():
     if not files:
         return {"ok": False, "message": "No knowledge files found"}
 
-    all_docs, all_ids, all_metas = [], [], []
+    all_docs: List[str] = []
+    all_ids: List[str] = []
+    all_metas: List[Dict] = []
 
     for path in files:
         text = _read_file(path)
@@ -111,30 +112,52 @@ def ingest_knowledge_base():
         chunks = _chunk_text(text)
 
         for i, chunk in enumerate(chunks):
+            chunk_id = _make_chunk_id(path, i, chunk)
             all_docs.append(chunk)
-            all_ids.append(_make_chunk_id(path, i, chunk))
-            all_metas.append({
-                **meta,
-                "chunk_index": i
-            })
+            all_ids.append(chunk_id)
+            all_metas.append({**meta, "chunk_index": i})
 
     if not all_docs:
         return {"ok": False, "message": "No valid content found"}
 
-    print("Embedding chunks:", len(all_docs))
-    vectors = embed_texts(all_docs)
+    existing_ids = set()
+    try:
+        existing = collection.get(include=[])
+        existing_ids = set(existing.get("ids", []) or [])
+    except Exception as exc:
+        print("Warning: could not read existing IDs from Chroma:", exc)
 
-    # 🔥 normalize embeddings (fix "_type" error)
+    new_docs: List[str] = []
+    new_ids: List[str] = []
+    new_metas: List[Dict] = []
+
+    for doc, doc_id, meta in zip(all_docs, all_ids, all_metas):
+        if doc_id in existing_ids:
+            continue
+        new_docs.append(doc)
+        new_ids.append(doc_id)
+        new_metas.append(meta)
+
+    if not new_docs:
+        return {
+            "ok": True,
+            "chunks_indexed": 0,
+            "message": "No new chunks to index",
+        }
+
+    print("Embedding new chunks:", len(new_docs))
+    vectors = embed_texts(new_docs)
     vectors = [list(map(float, v)) for v in vectors]
 
     collection.add(
-        ids=all_ids,
-        documents=all_docs,
-        metadatas=all_metas,
+        ids=new_ids,
+        documents=new_docs,
+        metadatas=new_metas,
         embeddings=vectors,
     )
 
     return {
         "ok": True,
-        "chunks_indexed": len(all_docs),
+        "chunks_indexed": len(new_docs),
+        "message": "Indexed only new chunks",
     }
