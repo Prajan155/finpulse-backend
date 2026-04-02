@@ -1240,24 +1240,26 @@ def get_quote(ticker: str) -> dict:
             exchange = fast.get("exchange") or exchange
             currency = fast.get("currency") or currency
 
-        # 2) Intraday history fallback
+        # 2) STRONG fallback using yf.download (WORKS ON RENDER)
         if price is None:
             try:
-                hist_intraday = t.history(
+                df = yf.download(
+                    ticker,
                     period="1d",
                     interval="1m",
-                    auto_adjust=False,
-                    actions=False,
+                    progress=False,
+                    threads=False,
                 )
-                hist_intraday = _normalize_download_df(hist_intraday)
 
-                if hist_intraday is not None and not hist_intraday.empty and "Close" in hist_intraday.columns:
-                    closes = hist_intraday["Close"].dropna()
+                df = _normalize_download_df(df)
+
+                if df is not None and not df.empty and "Close" in df.columns:
+                    closes = df["Close"].dropna()
                     if len(closes) >= 1:
                         price = _safe_float_or_none(closes.iloc[-1])
-            except Exception:
-                logger.exception("Intraday quote history fetch failed for ticker=%s", ticker)
 
+            except Exception:
+                logger.exception("yf.download fallback failed for ticker=%s", ticker)
         # 3) Daily history fallback for previous close
         if prev_close is None:
             try:
