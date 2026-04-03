@@ -1200,6 +1200,41 @@ _profile_cache = TTLCache(maxsize=2000, ttl=3600)
 def _now_iso():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
+def _get_indian_stock_price(ticker: str):
+    try:
+        print(f"[INDIA] using direct download for {ticker}")
+
+        df = yf.download(
+            ticker,
+            period="5d",
+            interval="1d",
+            progress=False,
+            threads=False,
+            auto_adjust=False,
+        )
+
+        df = _normalize_download_df(df)
+
+        if df is None or df.empty or "Close" not in df.columns:
+            print(f"[INDIA] download empty for {ticker}")
+            return None, None
+
+        closes = df["Close"].dropna()
+
+        if len(closes) == 0:
+            return None, None
+
+        price = float(closes.iloc[-1])
+        prev_close = float(closes.iloc[-2]) if len(closes) > 1 else None
+
+        print(f"[INDIA] price={price}, prev_close={prev_close}")
+
+        return price, prev_close
+
+    except Exception as e:
+        print(f"[INDIA] download failed for {ticker}: {e}")
+        return None, None
+
 
 def get_quote(ticker: str) -> dict:
     ticker = ticker.strip().upper()
@@ -1229,6 +1264,38 @@ def get_quote(ticker: str) -> dict:
     print(f"[QUOTE] ticker={ticker}")
     print(f"[QUOTE] finnhub_enabled={_finnhub_enabled()}")
 
+    # 🔥 INDIA FIRST: bypass Finnhub/Yahoo quote endpoints for NSE/BSE
+    if ticker.endswith(".NS") or ticker.endswith(".BO"):
+        price, prev_close = _get_indian_stock_price(ticker)
+
+        if price is not None:
+            change = None
+            change_pct = None
+
+            if prev_close not in (None, 0):
+                change = price - prev_close
+                change_pct = (change / prev_close) * 100
+
+            out = {
+                "symbol": ticker,
+                "name": ticker,
+                "exchange": "NSE" if ticker.endswith(".NS") else "BSE",
+                "market": "India",
+                "currency": "INR",
+                "price": price,
+                "change": change,
+                "changePercent": change_pct,
+                "marketState": "CLOSED",
+                "asOf": _now_iso(),
+            }
+
+            print(f"[QUOTE] returning INDIA direct-download result for {ticker}: {out}")
+            _quote_cache[ticker] = out
+            return out
+
+        print(f"[QUOTE] INDIA direct-download returned no price for {ticker}")
+        return base_out
+
     price = None
     prev_close = None
     change = None
@@ -1245,7 +1312,7 @@ def get_quote(ticker: str) -> dict:
             return None
         return num
 
-    # 1) FINNHUB QUOTE FIRST
+    # 1) FINNHUB QUOTE FIRST (US)
     if _finnhub_enabled():
         try:
             finnhub_q = _finnhub_quote(ticker)
@@ -1297,55 +1364,7 @@ def get_quote(ticker: str) -> dict:
             print(f"[QUOTE] Finnhub primary quote failed for {ticker}: {e}")
             logger.exception("Finnhub primary quote failed for ticker=%s", ticker)
 
-    # 2) FINNHUB CANDLE FALLBACK
-    if _finnhub_enabled() and not _is_valid_price(price):
-        try:
-            print(f"[QUOTE] trying finnhub candle fallback for {ticker}")
-            df = _finnhub_fetch_candles(ticker, "5d", "1d")
-            print(f"[QUOTE] candle df empty? {df is None or df.empty}")
-
-            if df is not None and not df.empty and "Close" in df.columns:
-                closes = df["Close"].dropna()
-
-                if len(closes) >= 1:
-                    price = _clean_num(closes.iloc[-1])
-
-                if len(closes) >= 2:
-                    prev_close = _clean_num(closes.iloc[-2])
-
-                if change is None and _is_valid_price(price) and prev_close not in (None, 0):
-                    change = float(price) - float(prev_close)
-
-                if change_pct is None and _is_valid_price(price) and prev_close not in (None, 0):
-                    change_pct = (float(price) - float(prev_close)) / float(prev_close) * 100
-
-            print(
-                f"[QUOTE] after candle fallback -> "
-                f"price={price}, prev_close={prev_close}, change={change}, change_pct={change_pct}"
-            )
-
-            if _is_valid_price(price):
-                out = {
-                    "symbol": ticker,
-                    "name": name or ticker,
-                    "exchange": exchange,
-                    "market": market or market_default,
-                    "currency": currency or currency_default,
-                    "price": _safe_float_or_none(price),
-                    "change": _safe_float_or_none(change),
-                    "changePercent": _safe_float_or_none(change_pct),
-                    "marketState": "CLOSED",
-                    "asOf": _now_iso(),
-                }
-                print(f"[QUOTE] returning finnhub candle fallback result for {ticker}: {out}")
-                _quote_cache[ticker] = out
-                return out
-
-        except Exception as e:
-            print(f"[QUOTE] Finnhub candle fallback failed for {ticker}: {e}")
-            logger.exception("Finnhub candle fallback failed for ticker=%s", ticker)
-
-    # 3) YFINANCE FALLBACK
+    # 2) YFINANCE FALLBACK (US)
     try:
         print(f"[QUOTE] entering yahoo fallback for {ticker}")
 
@@ -1381,19 +1400,12 @@ def get_quote(ticker: str) -> dict:
             except Exception:
                 currency_val = None
 
-            try:
-                exchange_val = fast.get("exchange")
-            except Exception:
-                exchange_val = None
-
             price = _clean_num(last_price_val) if not _is_valid_price(price) else price
             prev_close = _clean_num(prev_close_val) if prev_close is None else prev_close
             currency = _safe_nonempty_str(currency_val) or currency
-            exchange = _safe_nonempty_str(exchange_val) or exchange
 
             print(f"[QUOTE] FORCE fast_info price={price}, prev_close={prev_close}")
 
-        # 4) DIRECT DOWNLOAD FALLBACK
         if not _is_valid_price(price):
             try:
                 dl = yf.download(
@@ -1420,29 +1432,6 @@ def get_quote(ticker: str) -> dict:
             except Exception as e:
                 print(f"[QUOTE] direct download failed for {ticker}: {e}")
 
-        if t is not None and not _is_valid_price(price):
-            try:
-                hist_daily = t.history(
-                    period="5d",
-                    interval="1d",
-                    auto_adjust=False,
-                    actions=False,
-                )
-                hist_daily = _normalize_download_df(hist_daily)
-
-                print(f"[QUOTE] yahoo history empty for {ticker}? {hist_daily is None or hist_daily.empty}")
-
-                if hist_daily is not None and not hist_daily.empty and "Close" in hist_daily.columns:
-                    closes = hist_daily["Close"].dropna()
-                    if len(closes) >= 1:
-                        price = _clean_num(closes.iloc[-1])
-                    if len(closes) >= 2:
-                        prev_close = _clean_num(closes.iloc[-2])
-
-            except Exception as e:
-                print(f"[QUOTE] Daily quote history fetch failed for {ticker}: {e}")
-                logger.exception("Daily quote history fetch failed for ticker=%s", ticker)
-
         info = {}
         if t is not None:
             try:
@@ -1450,8 +1439,6 @@ def get_quote(ticker: str) -> dict:
             except Exception as e:
                 print(f"[QUOTE] info failed for {ticker}: {e}")
                 info = {}
-
-        print(f"[QUOTE] info keys for {ticker}: {list(info.keys())[:20] if isinstance(info, dict) else info}")
 
         if info:
             name = (
