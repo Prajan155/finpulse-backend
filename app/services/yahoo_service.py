@@ -1344,41 +1344,57 @@ def get_quote(ticker: str) -> dict:
     # 3) YFINANCE FALLBACK
     try:
         print(f"[QUOTE] entering yahoo fallback for {ticker}")
-        t = yf.Ticker(ticker)
 
         try:
-            fast = t.fast_info or {}
+            t = yf.Ticker(ticker)
         except Exception as e:
-            print(f"[QUOTE] fast_info failed for {ticker}: {e}")
-            fast = {}
+            print(f"[QUOTE] Yahoo init failed for {ticker}: {e}")
+            t = None
 
-        print(f"[QUOTE] fast_info keys for {ticker}: {list(fast.keys()) if isinstance(fast, dict) else fast}")
+        fast = {}
+        if t is not None:
+            try:
+                fast = t.fast_info or {}
+            except Exception as e:
+                print(f"[QUOTE] fast_info failed for {ticker}: {e}")
+                fast = {}
+
+        print(f"[QUOTE] fast_info keys for {ticker}: {list(fast.keys()) if hasattr(fast, 'keys') else fast}")
 
         if fast:
-            price = _safe_float_or_none(
-                _extract_fast_value(
-                    fast,
-                    "lastPrice",
-                    "last_price",
-                    "regularMarketPrice",
-                )
-            )
-            prev_close = _safe_float_or_none(
-                _extract_fast_value(
-                    fast,
-                    "previousClose",
-                    "previous_close",
-                )
-            )
-            exchange = _safe_nonempty_str(_extract_fast_value(fast, "exchange")) or exchange
-            currency = _safe_nonempty_str(_extract_fast_value(fast, "currency")) or currency
+            try:
+                last_price_val = fast.get("lastPrice")
+            except Exception:
+                last_price_val = None
+
+            try:
+                prev_close_val = fast.get("previousClose")
+            except Exception:
+                prev_close_val = None
+
+            try:
+                currency_val = fast.get("currency")
+            except Exception:
+                currency_val = None
+
+            try:
+                exchange_val = fast.get("exchange")
+            except Exception:
+                exchange_val = None
+
+            price = _safe_float_or_none(last_price_val) if not _is_valid_price(price) else price
+            prev_close = _safe_float_or_none(prev_close_val) if prev_close is None else prev_close
+            currency = _safe_nonempty_str(currency_val) or currency
+            exchange = _safe_nonempty_str(exchange_val) or exchange
+
+            print(f"[QUOTE] FORCE fast_info price={price}, prev_close={prev_close}")
 
         print(
             f"[QUOTE] after fast_info -> "
             f"price={price}, prev_close={prev_close}, exchange={exchange}, currency={currency}"
         )
 
-        if not _is_valid_price(price):
+        if t is not None and not _is_valid_price(price):
             try:
                 hist_daily = t.history(
                     period="5d",
@@ -1406,11 +1422,13 @@ def get_quote(ticker: str) -> dict:
                 print(f"[QUOTE] Daily quote history fetch failed for {ticker}: {e}")
                 logger.exception("Daily quote history fetch failed for ticker=%s", ticker)
 
-        try:
-            info = t.info or {}
-        except Exception as e:
-            print(f"[QUOTE] info failed for {ticker}: {e}")
-            info = {}
+        info = {}
+        if t is not None:
+            try:
+                info = t.info or {}
+            except Exception as e:
+                print(f"[QUOTE] info failed for {ticker}: {e}")
+                info = {}
 
         print(f"[QUOTE] info keys for {ticker}: {list(info.keys())[:20] if isinstance(info, dict) else info}")
 
@@ -1484,17 +1502,6 @@ def get_quote(ticker: str) -> dict:
             "asOf": _now_iso(),
         }
         return fallback
-
-    except Exception as e:
-        print(f"[QUOTE] final fallback used for {ticker}: {e}")
-        logger.exception("Unhandled get_quote failure for ticker=%s", ticker)
-        fallback = {
-            **base_out,
-            "asOf": _now_iso(),
-        }
-        _quote_cache[ticker] = fallback
-        return fallback
-
 
 def get_company_profile(symbol: str) -> dict:
     symbol = (symbol or "").upper().strip()
