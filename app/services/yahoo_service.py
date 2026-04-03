@@ -1204,7 +1204,12 @@ def _now_iso():
 def get_quote(ticker: str) -> dict:
     ticker = ticker.strip().upper()
 
-    cached = None
+    cached = _quote_cache.get(ticker)
+    if cached and cached.get("price") is not None:
+        print(f"[QUOTE] valid cache hit for {ticker}: {cached}")
+        return cached
+    elif cached:
+        print(f"[QUOTE] ignoring null cache for {ticker}: {cached}")
 
     market_default, currency_default = _default_market_currency(ticker)
 
@@ -1274,7 +1279,7 @@ def get_quote(ticker: str) -> dict:
                     "asOf": _now_iso(),
                 }
                 print(f"[QUOTE] returning finnhub quote result for {ticker}: {out}")
-                 # _quote_cache[ticker] = out
+                _quote_cache[ticker] = out
                 return out
 
         except Exception as e:
@@ -1329,7 +1334,7 @@ def get_quote(ticker: str) -> dict:
                     "asOf": _now_iso(),
                 }
                 print(f"[QUOTE] returning finnhub candle fallback result for {ticker}: {out}")
-                 #_quote_cache[ticker] = out
+                _quote_cache[ticker] = out
                 return out
 
         except Exception as e:
@@ -1466,8 +1471,19 @@ def get_quote(ticker: str) -> dict:
 
         print(f"[QUOTE] returning yahoo fallback result for {ticker}: {out}")
 
-         #_quote_cache[ticker] = out
+        if out["price"] is not None:
+            _quote_cache[ticker] = out
+
         return out
+
+    except Exception as e:
+        print(f"[QUOTE] final fallback used for {ticker}: {e}")
+        logger.exception("Unhandled get_quote failure for ticker=%s", ticker)
+        fallback = {
+            **base_out,
+            "asOf": _now_iso(),
+        }
+        return fallback
 
     except Exception as e:
         print(f"[QUOTE] final fallback used for {ticker}: {e}")
