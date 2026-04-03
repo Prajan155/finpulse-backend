@@ -1204,10 +1204,7 @@ def _now_iso():
 def get_quote(ticker: str) -> dict:
     ticker = ticker.strip().upper()
 
-    cached = _quote_cache.get(ticker)
-    if cached:
-        print(f"[QUOTE] cache hit for {ticker}: {cached}")
-        return cached
+    cached = None
 
     market_default, currency_default = _default_market_currency(ticker)
 
@@ -1277,7 +1274,7 @@ def get_quote(ticker: str) -> dict:
                     "asOf": _now_iso(),
                 }
                 print(f"[QUOTE] returning finnhub quote result for {ticker}: {out}")
-                _quote_cache[ticker] = out
+                 # _quote_cache[ticker] = out
                 return out
 
         except Exception as e:
@@ -1332,7 +1329,7 @@ def get_quote(ticker: str) -> dict:
                     "asOf": _now_iso(),
                 }
                 print(f"[QUOTE] returning finnhub candle fallback result for {ticker}: {out}")
-                _quote_cache[ticker] = out
+                 #_quote_cache[ticker] = out
                 return out
 
         except Exception as e:
@@ -1469,7 +1466,7 @@ def get_quote(ticker: str) -> dict:
 
         print(f"[QUOTE] returning yahoo fallback result for {ticker}: {out}")
 
-        _quote_cache[ticker] = out
+         #_quote_cache[ticker] = out
         return out
 
     except Exception as e:
