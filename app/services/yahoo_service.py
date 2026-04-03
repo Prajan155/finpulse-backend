@@ -11,6 +11,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from statsmodels.tsa.arima.model import ARIMA
+from app.services.upstox_service import get_upstox_quote
 
 from app.core.cache import ttl_cache
 
@@ -1200,42 +1201,6 @@ _profile_cache = TTLCache(maxsize=2000, ttl=3600)
 def _now_iso():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
-def _get_indian_stock_price(ticker: str):
-    try:
-        print(f"[INDIA] using direct download for {ticker}")
-
-        df = yf.download(
-            ticker,
-            period="5d",
-            interval="1d",
-            progress=False,
-            threads=False,
-            auto_adjust=False,
-        )
-
-        df = _normalize_download_df(df)
-
-        if df is None or df.empty or "Close" not in df.columns:
-            print(f"[INDIA] download empty for {ticker}")
-            return None, None
-
-        closes = df["Close"].dropna()
-
-        if len(closes) == 0:
-            return None, None
-
-        price = float(closes.iloc[-1])
-        prev_close = float(closes.iloc[-2]) if len(closes) > 1 else None
-
-        print(f"[INDIA] price={price}, prev_close={prev_close}")
-
-        return price, prev_close
-
-    except Exception as e:
-        print(f"[INDIA] download failed for {ticker}: {e}")
-        return None, None
-
-
 def get_quote(ticker: str) -> dict:
     ticker = ticker.strip().upper()
 
@@ -1264,37 +1229,110 @@ def get_quote(ticker: str) -> dict:
     print(f"[QUOTE] ticker={ticker}")
     print(f"[QUOTE] finnhub_enabled={_finnhub_enabled()}")
 
-    # 🔥 INDIA FIRST: bypass Finnhub/Yahoo quote endpoints for NSE/BSE
+    # 🔥 INDIA FIRST: use Upstox for NSE/BSE
     if ticker.endswith(".NS") or ticker.endswith(".BO"):
-        price, prev_close = _get_indian_stock_price(ticker)
+        try:
+            upstox_q = get_upstox_quote(ticker)
+            print(f"[QUOTE] upstox_q for {ticker}: {upstox_q}")
 
-        if price is not None:
+            if upstox_q:
+                price = _safe_float_or_none(upstox_q.get("price"))
+                prev_close = _safe_float_or_none(upstox_q.get("prevClose"))
+                change = _safe_float_or_none(upstox_q.get("change"))
+                change_pct = _safe_float_or_none(upstox_q.get("changePercent"))
+
+                if price is not None and change is None and prev_close not in (None, 0):
+                    change = price - prev_close
+
+                if price is not None and change_pct is None and prev_close not in (None, 0):
+                    change_pct = ((price - prev_close) / prev_close) * 100
+
+                out = {
+                    "symbol": ticker,
+                    "name": ticker,
+                    "exchange": "NSE" if ticker.endswith(".NS") else "BSE",
+                    "market": "India",
+                    "currency": "INR",
+                    "price": price,
+                    "change": change,
+                    "changePercent": change_pct,
+                    "marketState": "LIVE",
+                    "asOf": _now_iso(),
+                }
+
+                print(f"[QUOTE] returning UPSTOX result for {ticker}: {out}")
+
+                if out["price"] is not None:
+                    _quote_cache[ticker] = out
+
+                return out
+
+            print(f"[QUOTE] Upstox returned no price for {ticker}, falling back to Yahoo")
+        except Exception as e:
+            print(f"[QUOTE] Upstox failed for {ticker}: {e}")
+            logger.exception("Upstox quote failed for ticker=%s", ticker)
+
+        # fallback for Indian stocks too, if Upstox fails
+        try:
+            t = yf.Ticker(ticker)
+            fast = {}
+            info = {}
+
+            try:
+                fast = t.fast_info or {}
+            except Exception as e:
+                print(f"[QUOTE] India fast_info failed for {ticker}: {e}")
+
+            try:
+                info = t.info or {}
+            except Exception as e:
+                print(f"[QUOTE] India info failed for {ticker}: {e}")
+
+            price = _safe_float_or_none(
+                _extract_fast_value(fast, "lastPrice", "last_price")
+                or info.get("regularMarketPrice")
+                or info.get("currentPrice")
+            )
+            prev_close = _safe_float_or_none(
+                _extract_fast_value(fast, "previousClose", "previous_close")
+                or info.get("regularMarketPreviousClose")
+                or info.get("previousClose")
+            )
+
             change = None
             change_pct = None
-
-            if prev_close not in (None, 0):
+            if price is not None and prev_close not in (None, 0):
                 change = price - prev_close
                 change_pct = (change / prev_close) * 100
 
             out = {
                 "symbol": ticker,
-                "name": ticker,
+                "name": (
+                    info.get("shortName")
+                    or info.get("longName")
+                    or info.get("displayName")
+                    or ticker
+                ),
                 "exchange": "NSE" if ticker.endswith(".NS") else "BSE",
                 "market": "India",
-                "currency": "INR",
+                "currency": info.get("currency") or "INR",
                 "price": price,
                 "change": change,
                 "changePercent": change_pct,
-                "marketState": "CLOSED",
+                "marketState": info.get("marketState") or "CLOSED",
                 "asOf": _now_iso(),
             }
 
-            print(f"[QUOTE] returning INDIA direct-download result for {ticker}: {out}")
-            _quote_cache[ticker] = out
-            return out
+            print(f"[QUOTE] returning India Yahoo fallback result for {ticker}: {out}")
 
-        print(f"[QUOTE] INDIA direct-download returned no price for {ticker}")
-        return base_out
+            if out["price"] is not None:
+                _quote_cache[ticker] = out
+
+            return out
+        except Exception as e:
+            print(f"[QUOTE] India Yahoo fallback failed for {ticker}: {e}")
+            logger.exception("India fallback quote failed for ticker=%s", ticker)
+            return base_out
 
     price = None
     prev_close = None

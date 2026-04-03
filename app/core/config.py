@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     database_url: str
     gemini_api_key: str = ""
 
+    # 🔥 NEW — UPSTOX CONFIG
+    upstox_analytics_token: str = ""
+    upstox_base_url: str = "https://api.upstox.com/v2"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore",
