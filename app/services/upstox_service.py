@@ -1,8 +1,10 @@
-import requests
 import logging
+import requests
+
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
 
 def _headers():
     return {
@@ -10,14 +12,15 @@ def _headers():
         "Accept": "application/json",
     }
 
+
 def _to_upstox_symbol(symbol: str):
-    symbol = symbol.upper().strip()
+    symbol = (symbol or "").upper().strip()
 
     if symbol.endswith(".NS"):
-        return f"NSE_EQ|{symbol.replace('.NS', '')}"
+        return f"NSE_EQ|{symbol[:-3]}"
 
     if symbol.endswith(".BO"):
-        return f"BSE_EQ|{symbol.replace('.BO', '')}"
+        return f"BSE_EQ|{symbol[:-3]}"
 
     return None
 
@@ -25,50 +28,65 @@ def _to_upstox_symbol(symbol: str):
 def get_upstox_quote(symbol: str):
     instrument = _to_upstox_symbol(symbol)
     if not instrument:
+        print(f"[UPSTOX] invalid symbol mapping for {symbol}")
         return None
 
     try:
         url = "https://api.upstox.com/v3/market-quote/ohlc"
-
         params = {
             "instrument_key": instrument,
-            "interval": "1day"
+            "interval": "1day",
         }
 
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        print(f"[UPSTOX] symbol={symbol}")
+        print(f"[UPSTOX] instrument={instrument}")
+        print(f"[UPSTOX] token_present={bool((settings.upstox_analytics_token or '').strip())}")
 
-        print("UPSTOX STATUS:", resp.status_code)
-        print("UPSTOX RAW:", resp.text[:500])
+        resp = requests.get(
+            url,
+            headers=_headers(),
+            params=params,
+            timeout=12,
+        )
+
+        print(f"[UPSTOX] status={resp.status_code}")
+        print(f"[UPSTOX] raw={resp.text[:1000]}")
 
         resp.raise_for_status()
-        data = resp.json()
+        payload = resp.json() or {}
 
-        quote = data.get("data", {}).get(instrument)
+        quote = (payload.get("data") or {}).get(instrument)
+        print(f"[UPSTOX] parsed_quote={quote}")
 
         if not quote:
-            print("UPSTOX: no quote found")
             return None
 
-        live = quote.get("live_ohlc", {})
-        prev = quote.get("prev_ohlc", {})
+        live_ohlc = quote.get("live_ohlc") or {}
+        prev_ohlc = quote.get("prev_ohlc") or {}
 
-        price = live.get("close")
-        prev_close = prev.get("close")
+        price = live_ohlc.get("close")
+        prev_close = prev_ohlc.get("close")
+
+        if price is None:
+            price = quote.get("ltp") or quote.get("last_price")
 
         change = None
         change_percent = None
 
         if price is not None and prev_close not in (None, 0):
-            change = price - prev_close
-            change_percent = (change / prev_close) * 100
+            change = float(price) - float(prev_close)
+            change_percent = (change / float(prev_close)) * 100
 
-        return {
-            "price": price,
-            "change": change,
-            "changePercent": change_percent,
-            "prevClose": prev_close,
+        result = {
+            "price": float(price) if price is not None else None,
+            "change": float(change) if change is not None else None,
+            "changePercent": float(change_percent) if change_percent is not None else None,
+            "prevClose": float(prev_close) if prev_close is not None else None,
         }
 
+        print(f"[UPSTOX] result={result}")
+        return result
+
     except Exception as e:
-        logger.exception(f"Upstox quote failed for {symbol}: {e}")
+        logger.exception("Upstox quote failed for %s: %s", symbol, e)
         return None
