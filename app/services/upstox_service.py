@@ -10,6 +10,17 @@ def _headers():
         "Accept": "application/json",
     }
 
+def _to_upstox_symbol(symbol: str):
+    symbol = symbol.upper().strip()
+
+    if symbol.endswith(".NS"):
+        return f"NSE_EQ|{symbol.replace('.NS', '')}"
+
+    if symbol.endswith(".BO"):
+        return f"BSE_EQ|{symbol.replace('.BO', '')}"
+
+    return None
+
 
 def get_upstox_quote(symbol: str):
     instrument = _to_upstox_symbol(symbol)
