@@ -1225,7 +1225,17 @@ def get_quote(ticker: str) -> dict:
 
     logger.info("get_quote called for ticker=%s finnhub_enabled=%s", ticker, _finnhub_enabled())
 
-    # 1) FINNHUB FIRST (production primary)
+    price = None
+    prev_close = None
+    change = None
+    change_pct = None
+    name = ticker
+    exchange = None
+    market = market_default
+    currency = currency_default
+    market_state = "CLOSED"
+
+    # 1) FINNHUB QUOTE FIRST
     if _finnhub_enabled():
         try:
             finnhub_q = _finnhub_quote(ticker)
@@ -1239,28 +1249,28 @@ def get_quote(ticker: str) -> dict:
                 finnhub_q.get("changePercent") if finnhub_q else None,
             )
 
-            finnhub_price = _safe_float_or_none(finnhub_q.get("price")) if finnhub_q else None
-            if _is_valid_price(finnhub_price):
+            if finnhub_profile:
+                name = finnhub_profile.get("name") or name
+                exchange = finnhub_profile.get("exchange") or exchange
+                currency = finnhub_profile.get("currency") or currency
+                market = _infer_market_from_exchange(exchange, ticker)
+
+            if finnhub_q:
+                price = _safe_float_or_none(finnhub_q.get("price"))
+                prev_close = _safe_float_or_none(finnhub_q.get("prevClose"))
+                change = _safe_float_or_none(finnhub_q.get("change"))
+                change_pct = _safe_float_or_none(finnhub_q.get("changePercent"))
+
+            if _is_valid_price(price):
                 out = {
                     "symbol": ticker,
-                    "name": (
-                        finnhub_profile.get("name")
-                        if finnhub_profile and finnhub_profile.get("name")
-                        else ticker
-                    ),
-                    "exchange": finnhub_profile.get("exchange") if finnhub_profile else None,
-                    "market": _infer_market_from_exchange(
-                        finnhub_profile.get("exchange") if finnhub_profile else None,
-                        ticker,
-                    ),
-                    "currency": (
-                        finnhub_profile.get("currency")
-                        if finnhub_profile and finnhub_profile.get("currency")
-                        else currency_default
-                    ),
-                    "price": finnhub_price,
-                    "change": _safe_float_or_none(finnhub_q.get("change")),
-                    "changePercent": _safe_float_or_none(finnhub_q.get("changePercent")),
+                    "name": name or ticker,
+                    "exchange": exchange,
+                    "market": market or market_default,
+                    "currency": currency or currency_default,
+                    "price": price,
+                    "change": change,
+                    "changePercent": change_pct,
                     "marketState": "LIVE",
                     "asOf": _now_iso(),
                 }
@@ -1269,19 +1279,55 @@ def get_quote(ticker: str) -> dict:
         except Exception:
             logger.exception("Finnhub primary quote failed for ticker=%s", ticker)
 
-    # 2) YFINANCE FALLBACK
+    # 2) FINNHUB CANDLE FALLBACK (VERY IMPORTANT FOR NSE/BSE)
+    if _finnhub_enabled() and not _is_valid_price(price):
+        try:
+            df = _finnhub_fetch_candles(ticker, "5d", "1d")
+            if df is not None and not df.empty and "Close" in df.columns:
+                closes = df["Close"].dropna()
+
+                if len(closes) >= 1:
+                    price = _safe_float_or_none(closes.iloc[-1])
+
+                if len(closes) >= 2:
+                    prev_close = _safe_float_or_none(closes.iloc[-2])
+
+                if change is None and _is_valid_price(price) and prev_close not in (None, 0):
+                    change = float(price) - float(prev_close)
+
+                if change_pct is None and _is_valid_price(price) and prev_close not in (None, 0):
+                    change_pct = (float(price) - float(prev_close)) / float(prev_close) * 100
+
+                logger.info(
+                    "Finnhub candle fallback for %s -> price=%s prev_close=%s change=%s changePercent=%s",
+                    ticker,
+                    price,
+                    prev_close,
+                    change,
+                    change_pct,
+                )
+        except Exception:
+            logger.exception("Finnhub candle fallback failed for ticker=%s", ticker)
+
+    if _is_valid_price(price):
+        out = {
+            "symbol": ticker,
+            "name": name or ticker,
+            "exchange": exchange,
+            "market": market or market_default,
+            "currency": currency or currency_default,
+            "price": _safe_float_or_none(price),
+            "change": _safe_float_or_none(change),
+            "changePercent": _safe_float_or_none(change_pct),
+            "marketState": "CLOSED",
+            "asOf": _now_iso(),
+        }
+        _quote_cache[ticker] = out
+        return out
+
+    # 3) YFINANCE FALLBACK
     try:
         t = yf.Ticker(ticker)
-
-        name = ticker
-        exchange = None
-        market = market_default
-        currency = currency_default
-        market_state = "CLOSED"
-        price = None
-        prev_close = None
-        change = None
-        change_pct = None
 
         try:
             fast = t.fast_info or {}
@@ -1304,32 +1350,10 @@ def get_quote(ticker: str) -> dict:
                     "previous_close",
                 )
             )
-            exchange = _safe_nonempty_str(
-                _extract_fast_value(fast, "exchange")
-            ) or exchange
-            currency = _safe_nonempty_str(
-                _extract_fast_value(fast, "currency")
-            ) or currency
+            exchange = _safe_nonempty_str(_extract_fast_value(fast, "exchange")) or exchange
+            currency = _safe_nonempty_str(_extract_fast_value(fast, "currency")) or currency
 
         if not _is_valid_price(price):
-            try:
-                df = yf.download(
-                    ticker,
-                    period="1d",
-                    interval="1m",
-                    progress=False,
-                    threads=False,
-                    auto_adjust=False,
-                )
-                df = _normalize_download_df(df)
-                if df is not None and not df.empty and "Close" in df.columns:
-                    closes = df["Close"].dropna()
-                    if len(closes) >= 1:
-                        price = _safe_float_or_none(closes.iloc[-1])
-            except Exception:
-                logger.exception("yf.download intraday fallback failed for ticker=%s", ticker)
-
-        if prev_close is None:
             try:
                 hist_daily = t.history(
                     period="5d",
@@ -1341,12 +1365,10 @@ def get_quote(ticker: str) -> dict:
 
                 if hist_daily is not None and not hist_daily.empty and "Close" in hist_daily.columns:
                     closes = hist_daily["Close"].dropna()
-                    if len(closes) >= 2:
-                        if not _is_valid_price(price):
-                            price = _safe_float_or_none(closes.iloc[-1])
-                        prev_close = _safe_float_or_none(closes.iloc[-2])
-                    elif len(closes) == 1 and not _is_valid_price(price):
+                    if len(closes) >= 1:
                         price = _safe_float_or_none(closes.iloc[-1])
+                    if len(closes) >= 2:
+                        prev_close = _safe_float_or_none(closes.iloc[-2])
             except Exception:
                 logger.exception("Daily quote history fetch failed for ticker=%s", ticker)
 
@@ -1392,11 +1414,10 @@ def get_quote(ticker: str) -> dict:
                 )
 
         if change is None and _is_valid_price(price) and prev_close not in (None, 0):
-            try:
-                change = float(price) - float(prev_close)
-                change_pct = (change / float(prev_close)) * 100
-            except Exception:
-                logger.warning("Failed change calculation for ticker=%s", ticker)
+            change = float(price) - float(prev_close)
+
+        if change_pct is None and _is_valid_price(price) and prev_close not in (None, 0):
+            change_pct = (float(price) - float(prev_close)) / float(prev_close) * 100
 
         out = {
             "symbol": ticker,
