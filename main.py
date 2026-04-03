@@ -27,6 +27,7 @@ app = FastAPI(
 def on_startup():
     init_db()
     start_scheduler()
+    print("🔥 FinPulse backend startup complete")
 
 
 limiter = Limiter(key_func=get_remote_address)
@@ -37,12 +38,16 @@ register_exception_handlers(app)
 
 app.middleware("http")(log_requests_middleware)
 
+# Keep explicit local/dev origins, plus any Vercel preview URL
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
         "https://finpulse-nexus.vercel.app",
+        "https://finpulse-nexus-rtd7.vercel.app",
     ],
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
@@ -52,4 +57,8 @@ app.add_middleware(
 
 app.include_router(api_router, prefix=settings.api_prefix)
 app.include_router(health_router, prefix=settings.api_prefix)
-app.include_router(firepulse_router, prefix=settings.api_prefix + "/firepulse", tags=["FirePulse"])
+app.include_router(
+    firepulse_router,
+    prefix=settings.api_prefix + "/firepulse",
+    tags=["FirePulse"],
+)
