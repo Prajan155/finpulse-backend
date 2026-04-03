@@ -1239,6 +1239,12 @@ def get_quote(ticker: str) -> dict:
     currency = currency_default
     market_state = "CLOSED"
 
+    def _clean_num(value):
+        num = _safe_float_or_none(value)
+        if num in (None, 0, 0.0):
+            return None
+        return num
+
     # 1) FINNHUB QUOTE FIRST
     if _finnhub_enabled():
         try:
@@ -1255,10 +1261,10 @@ def get_quote(ticker: str) -> dict:
                 market = _infer_market_from_exchange(exchange, ticker)
 
             if finnhub_q:
-                price = _safe_float_or_none(finnhub_q.get("price"))
-                prev_close = _safe_float_or_none(finnhub_q.get("prevClose"))
-                change = _safe_float_or_none(finnhub_q.get("change"))
-                change_pct = _safe_float_or_none(finnhub_q.get("changePercent"))
+                price = _clean_num(finnhub_q.get("price"))
+                prev_close = _clean_num(finnhub_q.get("prevClose"))
+                change = _clean_num(finnhub_q.get("change"))
+                change_pct = _clean_num(finnhub_q.get("changePercent"))
 
             print(
                 f"[QUOTE] after finnhub quote -> "
@@ -1266,6 +1272,11 @@ def get_quote(ticker: str) -> dict:
             )
 
             if _is_valid_price(price):
+                if change is None and prev_close not in (None, 0):
+                    change = float(price) - float(prev_close)
+                if change_pct is None and prev_close not in (None, 0):
+                    change_pct = (float(price) - float(prev_close)) / float(prev_close) * 100
+
                 out = {
                     "symbol": ticker,
                     "name": name or ticker,
@@ -1273,8 +1284,8 @@ def get_quote(ticker: str) -> dict:
                     "market": market or market_default,
                     "currency": currency or currency_default,
                     "price": price,
-                    "change": change,
-                    "changePercent": change_pct,
+                    "change": _safe_float_or_none(change),
+                    "changePercent": _safe_float_or_none(change_pct),
                     "marketState": "LIVE",
                     "asOf": _now_iso(),
                 }
@@ -1293,21 +1304,14 @@ def get_quote(ticker: str) -> dict:
             df = _finnhub_fetch_candles(ticker, "5d", "1d")
             print(f"[QUOTE] candle df empty? {df is None or df.empty}")
 
-            if df is not None and not df.empty:
-                try:
-                    print(f"[QUOTE] candle columns for {ticker}: {list(df.columns)}")
-                    print(f"[QUOTE] candle tail for {ticker}:\n{df.tail()}")
-                except Exception:
-                    pass
-
             if df is not None and not df.empty and "Close" in df.columns:
                 closes = df["Close"].dropna()
 
                 if len(closes) >= 1:
-                    price = _safe_float_or_none(closes.iloc[-1])
+                    price = _clean_num(closes.iloc[-1])
 
                 if len(closes) >= 2:
-                    prev_close = _safe_float_or_none(closes.iloc[-2])
+                    prev_close = _clean_num(closes.iloc[-2])
 
                 if change is None and _is_valid_price(price) and prev_close not in (None, 0):
                     change = float(price) - float(prev_close)
@@ -1382,17 +1386,39 @@ def get_quote(ticker: str) -> dict:
             except Exception:
                 exchange_val = None
 
-            price = _safe_float_or_none(last_price_val) if not _is_valid_price(price) else price
-            prev_close = _safe_float_or_none(prev_close_val) if prev_close is None else prev_close
+            price = _clean_num(last_price_val) if not _is_valid_price(price) else price
+            prev_close = _clean_num(prev_close_val) if prev_close is None else prev_close
             currency = _safe_nonempty_str(currency_val) or currency
             exchange = _safe_nonempty_str(exchange_val) or exchange
 
             print(f"[QUOTE] FORCE fast_info price={price}, prev_close={prev_close}")
 
-        print(
-            f"[QUOTE] after fast_info -> "
-            f"price={price}, prev_close={prev_close}, exchange={exchange}, currency={currency}"
-        )
+        # 4) DIRECT DOWNLOAD FALLBACK
+        if not _is_valid_price(price):
+            try:
+                dl = yf.download(
+                    ticker,
+                    period="5d",
+                    interval="1d",
+                    progress=False,
+                    threads=False,
+                    auto_adjust=False,
+                )
+                dl = _normalize_download_df(dl)
+
+                print(f"[QUOTE] direct download empty for {ticker}? {dl is None or dl.empty}")
+
+                if dl is not None and not dl.empty and "Close" in dl.columns:
+                    closes = dl["Close"].dropna()
+                    if len(closes) >= 1:
+                        price = _clean_num(closes.iloc[-1])
+                    if len(closes) >= 2:
+                        prev_close = _clean_num(closes.iloc[-2])
+
+                    print(f"[QUOTE] after direct download -> price={price}, prev_close={prev_close}")
+
+            except Exception as e:
+                print(f"[QUOTE] direct download failed for {ticker}: {e}")
 
         if t is not None and not _is_valid_price(price):
             try:
@@ -1405,18 +1431,13 @@ def get_quote(ticker: str) -> dict:
                 hist_daily = _normalize_download_df(hist_daily)
 
                 print(f"[QUOTE] yahoo history empty for {ticker}? {hist_daily is None or hist_daily.empty}")
-                if hist_daily is not None and not hist_daily.empty:
-                    try:
-                        print(f"[QUOTE] yahoo history tail for {ticker}:\n{hist_daily.tail()}")
-                    except Exception:
-                        pass
 
                 if hist_daily is not None and not hist_daily.empty and "Close" in hist_daily.columns:
                     closes = hist_daily["Close"].dropna()
                     if len(closes) >= 1:
-                        price = _safe_float_or_none(closes.iloc[-1])
+                        price = _clean_num(closes.iloc[-1])
                     if len(closes) >= 2:
-                        prev_close = _safe_float_or_none(closes.iloc[-2])
+                        prev_close = _clean_num(closes.iloc[-2])
 
             except Exception as e:
                 print(f"[QUOTE] Daily quote history fetch failed for {ticker}: {e}")
@@ -1456,23 +1477,32 @@ def get_quote(ticker: str) -> dict:
             market_state = info.get("marketState") or market_state
 
             if not _is_valid_price(price):
-                price = _safe_float_or_none(
+                price = _clean_num(
                     info.get("regularMarketPrice")
                     or info.get("currentPrice")
                     or info.get("previousClose")
                 )
 
             if prev_close is None:
-                prev_close = _safe_float_or_none(
+                prev_close = _clean_num(
                     info.get("regularMarketPreviousClose")
                     or info.get("previousClose")
                 )
+
+        if not _is_valid_price(price):
+            price = None
+        if prev_close in (0, 0.0):
+            prev_close = None
 
         if change is None and _is_valid_price(price) and prev_close not in (None, 0):
             change = float(price) - float(prev_close)
 
         if change_pct is None and _is_valid_price(price) and prev_close not in (None, 0):
             change_pct = (float(price) - float(prev_close)) / float(prev_close) * 100
+
+        if price is None:
+            change = None
+            change_pct = None
 
         out = {
             "symbol": ticker,
