@@ -1206,6 +1206,7 @@ def get_quote(ticker: str) -> dict:
 
     cached = _quote_cache.get(ticker)
     if cached:
+        print(f"[QUOTE] cache hit for {ticker}: {cached}")
         return cached
 
     market_default, currency_default = _default_market_currency(ticker)
@@ -1223,7 +1224,8 @@ def get_quote(ticker: str) -> dict:
         "asOf": _now_iso(),
     }
 
-    logger.info("get_quote called for ticker=%s finnhub_enabled=%s", ticker, _finnhub_enabled())
+    print(f"[QUOTE] ticker={ticker}")
+    print(f"[QUOTE] finnhub_enabled={_finnhub_enabled()}")
 
     price = None
     prev_close = None
@@ -1241,13 +1243,8 @@ def get_quote(ticker: str) -> dict:
             finnhub_q = _finnhub_quote(ticker)
             finnhub_profile = _finnhub_company_profile(ticker)
 
-            logger.info(
-                "Finnhub quote for %s -> price=%s change=%s changePercent=%s",
-                ticker,
-                finnhub_q.get("price") if finnhub_q else None,
-                finnhub_q.get("change") if finnhub_q else None,
-                finnhub_q.get("changePercent") if finnhub_q else None,
-            )
+            print(f"[QUOTE] finnhub_q for {ticker}: {finnhub_q}")
+            print(f"[QUOTE] finnhub_profile for {ticker}: {finnhub_profile}")
 
             if finnhub_profile:
                 name = finnhub_profile.get("name") or name
@@ -1260,6 +1257,11 @@ def get_quote(ticker: str) -> dict:
                 prev_close = _safe_float_or_none(finnhub_q.get("prevClose"))
                 change = _safe_float_or_none(finnhub_q.get("change"))
                 change_pct = _safe_float_or_none(finnhub_q.get("changePercent"))
+
+            print(
+                f"[QUOTE] after finnhub quote -> "
+                f"price={price}, prev_close={prev_close}, change={change}, change_pct={change_pct}"
+            )
 
             if _is_valid_price(price):
                 out = {
@@ -1274,15 +1276,28 @@ def get_quote(ticker: str) -> dict:
                     "marketState": "LIVE",
                     "asOf": _now_iso(),
                 }
+                print(f"[QUOTE] returning finnhub quote result for {ticker}: {out}")
                 _quote_cache[ticker] = out
                 return out
-        except Exception:
+
+        except Exception as e:
+            print(f"[QUOTE] Finnhub primary quote failed for {ticker}: {e}")
             logger.exception("Finnhub primary quote failed for ticker=%s", ticker)
 
-    # 2) FINNHUB CANDLE FALLBACK (VERY IMPORTANT FOR NSE/BSE)
+    # 2) FINNHUB CANDLE FALLBACK
     if _finnhub_enabled() and not _is_valid_price(price):
         try:
+            print(f"[QUOTE] trying finnhub candle fallback for {ticker}")
             df = _finnhub_fetch_candles(ticker, "5d", "1d")
+            print(f"[QUOTE] candle df empty? {df is None or df.empty}")
+
+            if df is not None and not df.empty:
+                try:
+                    print(f"[QUOTE] candle columns for {ticker}: {list(df.columns)}")
+                    print(f"[QUOTE] candle tail for {ticker}:\n{df.tail()}")
+                except Exception:
+                    pass
+
             if df is not None and not df.empty and "Close" in df.columns:
                 closes = df["Close"].dropna()
 
@@ -1298,41 +1313,44 @@ def get_quote(ticker: str) -> dict:
                 if change_pct is None and _is_valid_price(price) and prev_close not in (None, 0):
                     change_pct = (float(price) - float(prev_close)) / float(prev_close) * 100
 
-                logger.info(
-                    "Finnhub candle fallback for %s -> price=%s prev_close=%s change=%s changePercent=%s",
-                    ticker,
-                    price,
-                    prev_close,
-                    change,
-                    change_pct,
-                )
-        except Exception:
-            logger.exception("Finnhub candle fallback failed for ticker=%s", ticker)
+            print(
+                f"[QUOTE] after candle fallback -> "
+                f"price={price}, prev_close={prev_close}, change={change}, change_pct={change_pct}"
+            )
 
-    if _is_valid_price(price):
-        out = {
-            "symbol": ticker,
-            "name": name or ticker,
-            "exchange": exchange,
-            "market": market or market_default,
-            "currency": currency or currency_default,
-            "price": _safe_float_or_none(price),
-            "change": _safe_float_or_none(change),
-            "changePercent": _safe_float_or_none(change_pct),
-            "marketState": "CLOSED",
-            "asOf": _now_iso(),
-        }
-        _quote_cache[ticker] = out
-        return out
+            if _is_valid_price(price):
+                out = {
+                    "symbol": ticker,
+                    "name": name or ticker,
+                    "exchange": exchange,
+                    "market": market or market_default,
+                    "currency": currency or currency_default,
+                    "price": _safe_float_or_none(price),
+                    "change": _safe_float_or_none(change),
+                    "changePercent": _safe_float_or_none(change_pct),
+                    "marketState": "CLOSED",
+                    "asOf": _now_iso(),
+                }
+                print(f"[QUOTE] returning finnhub candle fallback result for {ticker}: {out}")
+                _quote_cache[ticker] = out
+                return out
+
+        except Exception as e:
+            print(f"[QUOTE] Finnhub candle fallback failed for {ticker}: {e}")
+            logger.exception("Finnhub candle fallback failed for ticker=%s", ticker)
 
     # 3) YFINANCE FALLBACK
     try:
+        print(f"[QUOTE] entering yahoo fallback for {ticker}")
         t = yf.Ticker(ticker)
 
         try:
             fast = t.fast_info or {}
-        except Exception:
+        except Exception as e:
+            print(f"[QUOTE] fast_info failed for {ticker}: {e}")
             fast = {}
+
+        print(f"[QUOTE] fast_info keys for {ticker}: {list(fast.keys()) if isinstance(fast, dict) else fast}")
 
         if fast:
             price = _safe_float_or_none(
@@ -1353,6 +1371,11 @@ def get_quote(ticker: str) -> dict:
             exchange = _safe_nonempty_str(_extract_fast_value(fast, "exchange")) or exchange
             currency = _safe_nonempty_str(_extract_fast_value(fast, "currency")) or currency
 
+        print(
+            f"[QUOTE] after fast_info -> "
+            f"price={price}, prev_close={prev_close}, exchange={exchange}, currency={currency}"
+        )
+
         if not _is_valid_price(price):
             try:
                 hist_daily = t.history(
@@ -1363,19 +1386,31 @@ def get_quote(ticker: str) -> dict:
                 )
                 hist_daily = _normalize_download_df(hist_daily)
 
+                print(f"[QUOTE] yahoo history empty for {ticker}? {hist_daily is None or hist_daily.empty}")
+                if hist_daily is not None and not hist_daily.empty:
+                    try:
+                        print(f"[QUOTE] yahoo history tail for {ticker}:\n{hist_daily.tail()}")
+                    except Exception:
+                        pass
+
                 if hist_daily is not None and not hist_daily.empty and "Close" in hist_daily.columns:
                     closes = hist_daily["Close"].dropna()
                     if len(closes) >= 1:
                         price = _safe_float_or_none(closes.iloc[-1])
                     if len(closes) >= 2:
                         prev_close = _safe_float_or_none(closes.iloc[-2])
-            except Exception:
+
+            except Exception as e:
+                print(f"[QUOTE] Daily quote history fetch failed for {ticker}: {e}")
                 logger.exception("Daily quote history fetch failed for ticker=%s", ticker)
 
         try:
             info = t.info or {}
-        except Exception:
+        except Exception as e:
+            print(f"[QUOTE] info failed for {ticker}: {e}")
             info = {}
+
+        print(f"[QUOTE] info keys for {ticker}: {list(info.keys())[:20] if isinstance(info, dict) else info}")
 
         if info:
             name = (
@@ -1432,18 +1467,13 @@ def get_quote(ticker: str) -> dict:
             "asOf": _now_iso(),
         }
 
-        logger.info(
-            "Yahoo fallback quote for %s -> price=%s change=%s changePercent=%s",
-            ticker,
-            out["price"],
-            out["change"],
-            out["changePercent"],
-        )
+        print(f"[QUOTE] returning yahoo fallback result for {ticker}: {out}")
 
         _quote_cache[ticker] = out
         return out
 
-    except Exception:
+    except Exception as e:
+        print(f"[QUOTE] final fallback used for {ticker}: {e}")
         logger.exception("Unhandled get_quote failure for ticker=%s", ticker)
         fallback = {
             **base_out,
