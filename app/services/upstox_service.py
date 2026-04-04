@@ -35,7 +35,7 @@ def get_upstox_quote(symbol: str):
         url = "https://api.upstox.com/v3/market-quote/ohlc"
         params = {
             "instrument_key": instrument,
-            "interval": "1day",
+            "interval": "1d",
         }
 
         print(f"[UPSTOX] symbol={symbol}")
