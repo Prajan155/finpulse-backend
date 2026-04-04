@@ -5,9 +5,10 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 🔥 CACHE FOR SYMBOL → INSTRUMENT KEY
-_INSTRUMENT_MAP = {}
-
+# quick manual map for the symbols you need right now
+_MANUAL_INSTRUMENT_MAP = {
+    "RELIANCE": "NSE_EQ|INE002A01018",
+}
 
 def _headers():
     return {
@@ -15,48 +16,27 @@ def _headers():
         "Accept": "application/json",
     }
 
-
-# 🔥 DOWNLOAD INSTRUMENT MASTER
-def _load_instruments():
-    global _INSTRUMENT_MAP
-
-    if _INSTRUMENT_MAP:
-        return
-
-    try:
-        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json"
-        resp = requests.get(url, timeout=20)
-        resp.raise_for_status()
-
-        data = resp.json()
-
-        for item in data:
-            symbol = item.get("trading_symbol")
-            key = item.get("instrument_key")
-
-            if symbol and key:
-                _INSTRUMENT_MAP[symbol.upper()] = key
-
-        print(f"[UPSTOX] Loaded {len(_INSTRUMENT_MAP)} instruments")
-
-    except Exception as e:
-        logger.exception("Failed to load Upstox instruments: %s", e)
-
-
 def _resolve_instrument(symbol: str):
-    symbol = symbol.upper().strip()
+    symbol = (symbol or "").upper().strip()
 
     if symbol.endswith(".NS"):
         symbol = symbol[:-3]
+    elif symbol.endswith(".BO"):
+        symbol = symbol[:-3]
 
-    _load_instruments()
-
-    key = _INSTRUMENT_MAP.get(symbol)
-
-    print(f"[UPSTOX] resolved {symbol} → {key}")
-
+    key = _MANUAL_INSTRUMENT_MAP.get(symbol)
+    print(f"[UPSTOX] resolved {symbol} -> {key}")
     return key
 
+def _pick_first_number(*values):
+    for value in values:
+        try:
+            if value is None or value == "":
+                continue
+            return float(value)
+        except Exception:
+            continue
+    return None
 
 def get_upstox_quote(symbol: str):
     instrument = _resolve_instrument(symbol)
@@ -71,6 +51,7 @@ def get_upstox_quote(symbol: str):
 
         print(f"[UPSTOX] symbol={symbol}")
         print(f"[UPSTOX] instrument={instrument}")
+        print(f"[UPSTOX] token_present={bool((settings.upstox_analytics_token or '').strip())}")
 
         resp = requests.get(
             url,
@@ -80,34 +61,47 @@ def get_upstox_quote(symbol: str):
         )
 
         print(f"[UPSTOX] status={resp.status_code}")
-        print(f"[UPSTOX] raw={resp.text[:1000]}")
+        print(f"[UPSTOX] raw={resp.text[:1200]}")
 
         resp.raise_for_status()
         payload = resp.json() or {}
 
         quote = (payload.get("data") or {}).get(instrument)
-
-        print(f"[UPSTOX DEBUG] quote={quote}")
+        print(f"[UPSTOX DEBUG] full quote = {quote}")
 
         if not quote:
             return None
 
-        price = quote.get("last_price")
-        prev_close = quote.get("cp")
+        price = _pick_first_number(
+            quote.get("last_price"),
+            quote.get("ltp"),
+            quote.get("close"),
+            quote.get("price"),
+        )
+
+        prev_close = _pick_first_number(
+            quote.get("cp"),
+            quote.get("prev_close"),
+            quote.get("previous_close"),
+            quote.get("close"),
+        )
 
         change = None
         change_percent = None
 
-        if price and prev_close:
+        if price is not None and prev_close not in (None, 0):
             change = price - prev_close
             change_percent = (change / prev_close) * 100
 
-        return {
+        result = {
             "price": price,
             "change": change,
             "changePercent": change_percent,
             "prevClose": prev_close,
         }
+
+        print(f"[UPSTOX] result={result}")
+        return result
 
     except Exception as e:
         logger.exception("Upstox quote failed for %s: %s", symbol, e)
