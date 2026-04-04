@@ -5,16 +5,15 @@ import logging
 import os
 import time
 
-import requests
-from cachetools import TTLCache
-import yfinance as yf
-import pandas as pd
 import numpy as np
+import pandas as pd
+import requests
+import yfinance as yf
+from cachetools import TTLCache
 from statsmodels.tsa.arima.model import ARIMA
-from app.services.upstox_service import get_upstox_quote
 
 from app.core.cache import ttl_cache
-
+from app.services.upstox_service import get_upstox_quote
 
 logger = logging.getLogger(__name__)
 
@@ -590,7 +589,6 @@ def get_history(ticker: str, interval: str = "1d", range_: str = "6mo") -> dict:
 @ttl_cache(prefix="ratios", ttl_seconds=1800)
 def get_ratios(ticker: str) -> dict:
     ticker = ticker.strip().upper()
-    default = _empty_ratios(ticker)
 
     def _to_percent(value):
         val = _safe_float_or_none(value)
@@ -1201,15 +1199,18 @@ _profile_cache = TTLCache(maxsize=2000, ttl=3600)
 def _now_iso():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
+
 def get_quote(ticker: str) -> dict:
     ticker = ticker.strip().upper()
 
     cached = _quote_cache.get(ticker)
-    if cached and cached.get("price") is not None:
-        print(f"[QUOTE] valid cache hit for {ticker}: {cached}")
-        return cached
-    elif cached:
-        print(f"[QUOTE] ignoring null cache for {ticker}: {cached}")
+    if cached:
+        cached_price = cached.get("price")
+        if cached_price in (None, 0, 0.0):
+            print(f"[QUOTE] ignoring bad cache for {ticker}: {cached}")
+        else:
+            print(f"[QUOTE] valid cache hit for {ticker}: {cached}")
+            return cached
 
     market_default, currency_default = _default_market_currency(ticker)
 
@@ -1229,16 +1230,16 @@ def get_quote(ticker: str) -> dict:
     print(f"[QUOTE] ticker={ticker}")
     print(f"[QUOTE] finnhub_enabled={_finnhub_enabled()}")
 
-    # 🔥 INDIA FIRST: Upstox -> Finnhub -> stop (NO Yahoo fallback for India)
+    # INDIA FLOW: Upstox -> Finnhub -> stop
     if ticker.endswith(".NS") or ticker.endswith(".BO"):
         exchange_name = "NSE" if ticker.endswith(".NS") else "BSE"
 
-        # 1) Try Upstox
+        # 1) Upstox
         try:
             upstox_q = get_upstox_quote(ticker)
             print(f"[QUOTE] upstox_q for {ticker}: {upstox_q}")
 
-            if upstox_q and _safe_float_or_none(upstox_q.get("price")) is not None:
+            if upstox_q:
                 price = _safe_float_or_none(upstox_q.get("price"))
                 prev_close = _safe_float_or_none(upstox_q.get("prevClose"))
                 change = _safe_float_or_none(upstox_q.get("change"))
@@ -1250,22 +1251,22 @@ def get_quote(ticker: str) -> dict:
                 if price is not None and change_pct is None and prev_close not in (None, 0):
                     change_pct = ((price - prev_close) / prev_close) * 100
 
-                out = {
-                    "symbol": ticker,
-                    "name": ticker,
-                    "exchange": exchange_name,
-                    "market": "India",
-                    "currency": "INR",
-                    "price": price,
-                    "change": change,
-                    "changePercent": change_pct,
-                    "marketState": "LIVE",
-                    "asOf": _now_iso(),
-                }
-
-                print(f"[QUOTE] returning UPSTOX result for {ticker}: {out}")
-                _quote_cache[ticker] = out
-                return out
+                if price not in (None, 0, 0.0):
+                    out = {
+                        "symbol": ticker,
+                        "name": ticker,
+                        "exchange": exchange_name,
+                        "market": "India",
+                        "currency": "INR",
+                        "price": price,
+                        "change": change,
+                        "changePercent": change_pct,
+                        "marketState": "LIVE",
+                        "asOf": _now_iso(),
+                    }
+                    print(f"[QUOTE] returning UPSTOX result for {ticker}: {out}")
+                    _quote_cache[ticker] = out
+                    return out
 
             print(f"[QUOTE] Upstox returned no usable price for {ticker}, trying Finnhub")
         except Exception as e:
@@ -1289,7 +1290,7 @@ def get_quote(ticker: str) -> dict:
                 if price is not None and change_pct is None and prev_close not in (None, 0):
                     change_pct = ((price - prev_close) / prev_close) * 100
 
-                if price is not None:
+                if price not in (None, 0, 0.0):
                     out = {
                         "symbol": ticker,
                         "name": ticker,
@@ -1302,7 +1303,6 @@ def get_quote(ticker: str) -> dict:
                         "marketState": "LIVE",
                         "asOf": _now_iso(),
                     }
-
                     print(f"[QUOTE] returning FINNHUB fallback result for {ticker}: {out}")
                     _quote_cache[ticker] = out
                     return out
@@ -1312,7 +1312,7 @@ def get_quote(ticker: str) -> dict:
             print(f"[QUOTE] Finnhub fallback failed for {ticker}: {e}")
             logger.exception("Finnhub fallback failed for Indian ticker=%s", ticker)
 
-        # 3) No Yahoo fallback for India
+        # 3) No Yahoo for India
         print(f"[QUOTE] No valid India data source returned price for {ticker}")
         return {
             "symbol": ticker,
@@ -1327,9 +1327,7 @@ def get_quote(ticker: str) -> dict:
             "asOf": _now_iso(),
         }
 
-    # -----------------------------
     # US / NON-INDIA FLOW
-    # -----------------------------
     price = None
     prev_close = None
     change = None
@@ -1391,7 +1389,8 @@ def get_quote(ticker: str) -> dict:
                     "asOf": _now_iso(),
                 }
                 print(f"[QUOTE] returning finnhub quote result for {ticker}: {out}")
-                _quote_cache[ticker] = out
+                if out.get("price") not in (None, 0, 0.0):
+                    _quote_cache[ticker] = out
                 return out
 
         except Exception as e:
@@ -1540,7 +1539,7 @@ def get_quote(ticker: str) -> dict:
 
         print(f"[QUOTE] returning yahoo fallback result for {ticker}: {out}")
 
-        if out["price"] is not None:
+        if out.get("price") not in (None, 0, 0.0):
             _quote_cache[ticker] = out
 
         return out
@@ -1553,6 +1552,7 @@ def get_quote(ticker: str) -> dict:
             "asOf": _now_iso(),
         }
         return fallback
+
 
 def get_company_profile(symbol: str) -> dict:
     symbol = (symbol or "").upper().strip()
