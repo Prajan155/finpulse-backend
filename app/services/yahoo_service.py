@@ -1229,13 +1229,16 @@ def get_quote(ticker: str) -> dict:
     print(f"[QUOTE] ticker={ticker}")
     print(f"[QUOTE] finnhub_enabled={_finnhub_enabled()}")
 
-    # 🔥 INDIA FIRST: use Upstox for NSE/BSE
+    # 🔥 INDIA FIRST: Upstox -> Finnhub -> stop (NO Yahoo fallback for India)
     if ticker.endswith(".NS") or ticker.endswith(".BO"):
+        exchange_name = "NSE" if ticker.endswith(".NS") else "BSE"
+
+        # 1) Try Upstox
         try:
             upstox_q = get_upstox_quote(ticker)
             print(f"[QUOTE] upstox_q for {ticker}: {upstox_q}")
 
-            if upstox_q:
+            if upstox_q and _safe_float_or_none(upstox_q.get("price")) is not None:
                 price = _safe_float_or_none(upstox_q.get("price"))
                 prev_close = _safe_float_or_none(upstox_q.get("prevClose"))
                 change = _safe_float_or_none(upstox_q.get("change"))
@@ -1250,7 +1253,7 @@ def get_quote(ticker: str) -> dict:
                 out = {
                     "symbol": ticker,
                     "name": ticker,
-                    "exchange": "NSE" if ticker.endswith(".NS") else "BSE",
+                    "exchange": exchange_name,
                     "market": "India",
                     "currency": "INR",
                     "price": price,
@@ -1261,79 +1264,72 @@ def get_quote(ticker: str) -> dict:
                 }
 
                 print(f"[QUOTE] returning UPSTOX result for {ticker}: {out}")
-
-                if out["price"] is not None:
-                    _quote_cache[ticker] = out
-
+                _quote_cache[ticker] = out
                 return out
 
-            print(f"[QUOTE] Upstox returned no price for {ticker}, falling back to Yahoo")
+            print(f"[QUOTE] Upstox returned no usable price for {ticker}, trying Finnhub")
         except Exception as e:
             print(f"[QUOTE] Upstox failed for {ticker}: {e}")
             logger.exception("Upstox quote failed for ticker=%s", ticker)
 
-        # fallback for Indian stocks too, if Upstox fails
+        # 2) Finnhub fallback for India
         try:
-            t = yf.Ticker(ticker)
-            fast = {}
-            info = {}
+            finnhub_q = _finnhub_quote(ticker)
+            print(f"[QUOTE] finnhub_q for India ticker {ticker}: {finnhub_q}")
 
-            try:
-                fast = t.fast_info or {}
-            except Exception as e:
-                print(f"[QUOTE] India fast_info failed for {ticker}: {e}")
+            if finnhub_q:
+                price = _safe_float_or_none(finnhub_q.get("price"))
+                prev_close = _safe_float_or_none(finnhub_q.get("prevClose"))
+                change = _safe_float_or_none(finnhub_q.get("change"))
+                change_pct = _safe_float_or_none(finnhub_q.get("changePercent"))
 
-            try:
-                info = t.info or {}
-            except Exception as e:
-                print(f"[QUOTE] India info failed for {ticker}: {e}")
+                if price is not None and change is None and prev_close not in (None, 0):
+                    change = price - prev_close
 
-            price = _safe_float_or_none(
-                _extract_fast_value(fast, "lastPrice", "last_price")
-                or info.get("regularMarketPrice")
-                or info.get("currentPrice")
-            )
-            prev_close = _safe_float_or_none(
-                _extract_fast_value(fast, "previousClose", "previous_close")
-                or info.get("regularMarketPreviousClose")
-                or info.get("previousClose")
-            )
+                if price is not None and change_pct is None and prev_close not in (None, 0):
+                    change_pct = ((price - prev_close) / prev_close) * 100
 
-            change = None
-            change_pct = None
-            if price is not None and prev_close not in (None, 0):
-                change = price - prev_close
-                change_pct = (change / prev_close) * 100
+                if price is not None:
+                    out = {
+                        "symbol": ticker,
+                        "name": ticker,
+                        "exchange": exchange_name,
+                        "market": "India",
+                        "currency": "INR",
+                        "price": price,
+                        "change": change,
+                        "changePercent": change_pct,
+                        "marketState": "LIVE",
+                        "asOf": _now_iso(),
+                    }
 
-            out = {
-                "symbol": ticker,
-                "name": (
-                    info.get("shortName")
-                    or info.get("longName")
-                    or info.get("displayName")
-                    or ticker
-                ),
-                "exchange": "NSE" if ticker.endswith(".NS") else "BSE",
-                "market": "India",
-                "currency": info.get("currency") or "INR",
-                "price": price,
-                "change": change,
-                "changePercent": change_pct,
-                "marketState": info.get("marketState") or "CLOSED",
-                "asOf": _now_iso(),
-            }
+                    print(f"[QUOTE] returning FINNHUB fallback result for {ticker}: {out}")
+                    _quote_cache[ticker] = out
+                    return out
 
-            print(f"[QUOTE] returning India Yahoo fallback result for {ticker}: {out}")
-
-            if out["price"] is not None:
-                _quote_cache[ticker] = out
-
-            return out
+            print(f"[QUOTE] Finnhub also returned no usable price for {ticker}")
         except Exception as e:
-            print(f"[QUOTE] India Yahoo fallback failed for {ticker}: {e}")
-            logger.exception("India fallback quote failed for ticker=%s", ticker)
-            return base_out
+            print(f"[QUOTE] Finnhub fallback failed for {ticker}: {e}")
+            logger.exception("Finnhub fallback failed for Indian ticker=%s", ticker)
 
+        # 3) No Yahoo fallback for India
+        print(f"[QUOTE] No valid India data source returned price for {ticker}")
+        return {
+            "symbol": ticker,
+            "name": ticker,
+            "exchange": exchange_name,
+            "market": "India",
+            "currency": "INR",
+            "price": None,
+            "change": None,
+            "changePercent": None,
+            "marketState": "CLOSED",
+            "asOf": _now_iso(),
+        }
+
+    # -----------------------------
+    # US / NON-INDIA FLOW
+    # -----------------------------
     price = None
     prev_close = None
     change = None
@@ -1402,7 +1398,7 @@ def get_quote(ticker: str) -> dict:
             print(f"[QUOTE] Finnhub primary quote failed for {ticker}: {e}")
             logger.exception("Finnhub primary quote failed for ticker=%s", ticker)
 
-    # 2) YFINANCE FALLBACK (US)
+    # 2) YFINANCE FALLBACK (US ONLY)
     try:
         print(f"[QUOTE] entering yahoo fallback for {ticker}")
 
