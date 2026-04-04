@@ -18,10 +18,20 @@ def _to_upstox_symbol(symbol: str):
 
     if symbol.endswith(".NS"):
         return f"NSE_EQ|{symbol[:-3]}"
-
     if symbol.endswith(".BO"):
         return f"BSE_EQ|{symbol[:-3]}"
 
+    return None
+
+
+def _pick_first_number(*values):
+    for value in values:
+        try:
+            if value is None or value == "":
+                continue
+            return float(value)
+        except Exception:
+            continue
     return None
 
 
@@ -33,9 +43,7 @@ def get_upstox_quote(symbol: str):
 
     try:
         url = "https://api.upstox.com/v3/market-quote/ltp"
-        params = {
-            "instrument_key": instrument,
-        }
+        params = {"instrument_key": instrument}
 
         print(f"[UPSTOX] symbol={symbol}")
         print(f"[UPSTOX] instrument={instrument}")
@@ -49,42 +57,43 @@ def get_upstox_quote(symbol: str):
         )
 
         print(f"[UPSTOX] status={resp.status_code}")
-        print(f"[UPSTOX] raw={resp.text[:1000]}")
+        print(f"[UPSTOX] raw={resp.text[:1200]}")
 
         resp.raise_for_status()
         payload = resp.json() or {}
 
         quote = (payload.get("data") or {}).get(instrument)
-        print(f"[UPSTOX] parsed_quote={quote}")
+        print(f"[UPSTOX DEBUG] full quote = {quote}")
 
         if not quote:
             return None
 
-        price = (
-            quote.get("last_price")
-            or quote.get("ltp")
-            or quote.get("close")
+        price = _pick_first_number(
+            quote.get("last_price"),
+            quote.get("ltp"),
+            quote.get("close"),
+            quote.get("price"),
         )
 
-        prev_close = (
-            quote.get("cp")
-            or quote.get("prev_close")
-            or quote.get("previous_close")
-            or quote.get("close")
+        prev_close = _pick_first_number(
+            quote.get("cp"),
+            quote.get("prev_close"),
+            quote.get("previous_close"),
+            quote.get("close"),
         )
 
         change = None
         change_percent = None
 
         if price is not None and prev_close not in (None, 0):
-            change = float(price) - float(prev_close)
-            change_percent = (change / float(prev_close)) * 100
+            change = price - prev_close
+            change_percent = (change / prev_close) * 100
 
         result = {
-            "price": float(price) if price is not None else None,
-            "change": float(change) if change is not None else None,
-            "changePercent": float(change_percent) if change_percent is not None else None,
-            "prevClose": float(prev_close) if prev_close is not None else None,
+            "price": price,
+            "change": change,
+            "changePercent": change_percent,
+            "prevClose": prev_close,
         }
 
         print(f"[UPSTOX] result={result}")
