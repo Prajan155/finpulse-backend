@@ -32,10 +32,9 @@ def get_upstox_quote(symbol: str):
         return None
 
     try:
-        url = "https://api.upstox.com/v3/market-quote/ohlc"
+        url = "https://api.upstox.com/v3/market-quote/ltp"
         params = {
             "instrument_key": instrument,
-            "interval": "1d",
         }
 
         print(f"[UPSTOX] symbol={symbol}")
@@ -61,14 +60,8 @@ def get_upstox_quote(symbol: str):
         if not quote:
             return None
 
-        live_ohlc = quote.get("live_ohlc") or {}
-        prev_ohlc = quote.get("prev_ohlc") or {}
-
-        price = live_ohlc.get("close")
-        prev_close = prev_ohlc.get("close")
-
-        if price is None:
-            price = quote.get("ltp") or quote.get("last_price")
+        price = quote.get("last_price")
+        prev_close = quote.get("cp")
 
         change = None
         change_percent = None
