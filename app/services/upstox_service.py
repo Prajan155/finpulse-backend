@@ -60,8 +60,18 @@ def get_upstox_quote(symbol: str):
         if not quote:
             return None
 
-        price = quote.get("last_price")
-        prev_close = quote.get("cp")
+        price = (
+            quote.get("last_price")
+            or quote.get("ltp")
+            or quote.get("close")
+        )
+
+        prev_close = (
+            quote.get("cp")
+            or quote.get("prev_close")
+            or quote.get("previous_close")
+            or quote.get("close")
+        )
 
         change = None
         change_percent = None
