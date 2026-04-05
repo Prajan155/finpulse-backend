@@ -51,61 +51,91 @@ def _empty(symbol):
 # =========================
 # 🇮🇳 TWELVE DATA (PRIMARY)
 # =========================
-def _get_twelve_quote(symbol: str):
+def _get_twelve_quote(symbol: str) -> Optional[Dict[str, Any]]:
     if not TWELVE_API_KEY:
         logger.error("[TWELVE] API key missing")
         return None
 
-    try:
-        sym = symbol.upper().replace(".NS", "")
+    raw_symbol = (symbol or "").upper().strip()
 
-        # 🔥 FIXED FORMAT
-        full_symbol = f"{sym}.NSE"
+    candidates = []
+    base = raw_symbol
 
-        url = f"{TWELVE_BASE}/quote"
-        params = {
-            "symbol": full_symbol,
-            "apikey": TWELVE_API_KEY,
-        }
+    if base.startswith("NSE:") or base.startswith("BSE:"):
+        base = base.split(":", 1)[1]
 
-        logger.info("[TWELVE] requesting %s", full_symbol)
+    if base.endswith(".NS"):
+        core = base[:-3]
+        candidates = [
+            {"symbol": f"{core}.NSE"},
+            {"symbol": core, "exchange": "NSE"},
+            {"symbol": base},
+        ]
+    elif base.endswith(".BO"):
+        core = base[:-3]
+        candidates = [
+            {"symbol": f"{core}.BSE"},
+            {"symbol": core, "exchange": "BSE"},
+            {"symbol": base},
+        ]
+    else:
+        candidates = [
+            {"symbol": f"{base}.NSE"},
+            {"symbol": base, "exchange": "NSE"},
+            {"symbol": base},
+        ]
 
-        r = requests.get(url, params=params, timeout=10)
-        logger.info("[TWELVE] response: %s", r.text[:300])
+    for params in candidates:
+        try:
+            req = dict(params)
+            req["apikey"] = TWELVE_API_KEY
 
-        data = r.json()
+            logger.info("[TWELVE] trying params=%s", req)
 
-        # ❗ HANDLE API ERROR
-        if "code" in data:
-            logger.error("[TWELVE ERROR] %s", data)
-            return None
+            r = requests.get(f"{TWELVE_BASE}/quote", params=req, timeout=10)
+            body_preview = r.text[:500]
+            logger.info("[TWELVE] status=%s body=%s", r.status_code, body_preview)
 
-        price = _safe_float(data.get("price"))
-        prev_close = _safe_float(data.get("previous_close"))
+            r.raise_for_status()
 
-        if price is None:
-            return None
+            data = r.json()
+            if not isinstance(data, dict):
+                continue
 
-        change = price - prev_close if prev_close else None
-        change_pct = (change / prev_close * 100) if prev_close else None
+            if data.get("status") == "error" or data.get("code"):
+                logger.error("[TWELVE] api error for %s -> %s", symbol, data)
+                continue
 
-        return {
-            "symbol": symbol,
-            "name": data.get("name") or symbol,
-            "price": price,
-            "change": change,
-            "changePercent": change_pct,
-            "marketState": "LIVE",
-            "currency": "INR",
-            "exchange": "NSE",
-            "market": "India",
-            "asOf": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
+            price = _safe_float(data.get("price"))
+            prev_close = _safe_float(
+                data.get("previous_close")
+                or data.get("previousClose")
+                or data.get("prev_close")
+            )
 
-    except Exception:
-        logger.exception("[TWELVE] failed")
-        return None
+            if price is None:
+                logger.error("[TWELVE] no price for %s -> %s", symbol, data)
+                continue
 
+            exchange = "NSE"
+            if ".BO" in raw_symbol or raw_symbol.startswith("BSE:"):
+                exchange = "BSE"
+
+            return _build_quote(
+                symbol=raw_symbol,
+                name=data.get("name") or raw_symbol,
+                price=price,
+                previous_close=prev_close,
+                currency=data.get("currency") or "INR",
+                exchange=data.get("exchange") or exchange,
+                market="India",
+                source="twelve_data",
+            )
+
+        except Exception:
+            logger.exception("[TWELVE] failed attempt for %s with params=%s", symbol, params)
+
+    return None
 
 # =========================
 # 🇺🇸 FINNHUB (PRIMARY)
@@ -195,16 +225,15 @@ def get_quote(symbol: str):
     symbol = symbol.upper().strip()
 
     if _is_indian(symbol):
+        logger.info("[QUOTE][INDIA] symbol=%s twelve_key_present=%s", symbol, bool(TWELVE_API_KEY))
+
         q = _get_twelve_quote(symbol)
         if q:
+            logger.info("[QUOTE][INDIA] success via Twelve Data for %s", symbol)
             return q
 
-        q = _get_yahoo(symbol)
-        if q:
-            return q
-
-        return _empty(symbol)
-
+        logger.error("[QUOTE][INDIA] Twelve Data failed for %s", symbol)
+        return _empty(symbol, source="india_twelve_failed")
     else:
         q = _get_finnhub(symbol)
         if q:
