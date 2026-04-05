@@ -40,11 +40,7 @@ def _empty(symbol):
         "price": None,
         "change": None,
         "changePercent": None,
-        "marketState": "unknown",
-        "currency": None,
-        "exchange": None,
-        "market": "India" if _is_indian(symbol) else "US",
-        "asOf": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": source or "unknown"
     }
 
 
@@ -233,7 +229,7 @@ def get_quote(symbol: str):
             return q
 
         logger.error("[QUOTE][INDIA] Twelve Data failed for %s", symbol)
-        return _empty(symbol, source="india_twelve_failed")
+        return _empty(symbol)
     else:
         q = _get_finnhub(symbol)
         if q:
