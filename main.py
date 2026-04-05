@@ -7,11 +7,11 @@ from slowapi.util import get_remote_address
 
 from app.api.health import router as health_router
 from app.api.routes import router as api_router
+from app.api.firepulse import router as firepulse_router
 from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.core.init_db import init_db
 from app.core.middleware import log_requests_middleware
-from app.api.firepulse import router as firepulse_router
 from app.services.scheduler_service import start_scheduler
 
 app = FastAPI(
@@ -35,10 +35,8 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 register_exception_handlers(app)
-
 app.middleware("http")(log_requests_middleware)
 
-# Keep explicit local/dev origins, plus any Vercel preview URL
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -54,8 +52,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-API_PREFIX = "/api/"
 
 app.include_router(api_router, prefix=settings.api_prefix)
 app.include_router(health_router, prefix=settings.api_prefix)

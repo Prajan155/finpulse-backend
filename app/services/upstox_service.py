@@ -1,163 +1,337 @@
+import os
+import time
 import logging
-import requests
+from typing import Any, Dict, Optional
 
-from app.core.config import settings
+import requests
+import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-_SEARCH_CACHE = {}
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 
 
-def _headers():
-    return {
-        "Authorization": f"Bearer {(settings.upstox_analytics_token or '').strip()}",
-        "Accept": "application/json",
-    }
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
-def _pick_first_number(*values):
-    for value in values:
-        try:
-            if value is None or value == "":
-                continue
-            return float(value)
-        except Exception:
-            continue
-    return None
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_indian_symbol(symbol: str) -> bool:
+    s = (symbol or "").upper().strip()
+    return (
+        s.endswith(".NS")
+        or s.endswith(".BO")
+        or s.startswith("NSE:")
+        or s.startswith("BSE:")
+    )
 
 
 def _normalize_symbol(symbol: str) -> str:
-    symbol = (symbol or "").upper().strip()
-    if symbol.endswith(".NS") or symbol.endswith(".BO"):
-        return symbol[:-3]
-    return symbol
+    return (symbol or "").strip().upper()
 
 
-def _search_upstox_instrument(symbol: str) -> str | None:
-    normalized = _normalize_symbol(symbol)
+def _to_yahoo_symbol(symbol: str) -> str:
+    s = _normalize_symbol(symbol)
 
-    if normalized in _SEARCH_CACHE:
-        return _SEARCH_CACHE[normalized]
+    if s.startswith("NSE:"):
+        return s.replace("NSE:", "") + ".NS"
+    if s.startswith("BSE:"):
+        return s.replace("BSE:", "") + ".BO"
 
+    return s
+
+
+def _to_finnhub_symbol(symbol: str) -> str:
+    s = _normalize_symbol(symbol)
+
+    if s.endswith(".NS"):
+        return f"NSE:{s[:-3]}"
+    if s.endswith(".BO"):
+        return f"BSE:{s[:-3]}"
+
+    return s
+
+
+def _empty_quote(symbol: str, source: str = "none") -> Dict[str, Any]:
+    clean_symbol = _normalize_symbol(symbol)
+    now_ts = int(time.time())
+
+    return {
+        "symbol": clean_symbol,
+        "name": clean_symbol,
+        "price": None,
+        "current_price": None,
+        "change": None,
+        "change_percent": None,
+        "changePercent": None,
+        "previous_close": None,
+        "previousClose": None,
+        "open": None,
+        "day_high": None,
+        "dayHigh": None,
+        "high": None,
+        "day_low": None,
+        "dayLow": None,
+        "low": None,
+        "volume": None,
+        "currency": None,
+        "exchange": None,
+        "market_state": "unknown",
+        "marketState": "unknown",
+        "timestamp": now_ts,
+        "source": source,
+        "market": "India" if _is_indian_symbol(clean_symbol) else "US",
+        "asOf": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
+    }
+
+
+def _finalize_quote(
+    symbol: str,
+    *,
+    price: Optional[float],
+    previous_close: Optional[float],
+    open_price: Optional[float],
+    day_high: Optional[float],
+    day_low: Optional[float],
+    volume: Optional[int],
+    currency: Optional[str],
+    exchange: Optional[str],
+    market_state: Optional[str],
+    name: Optional[str],
+    source: str,
+) -> Dict[str, Any]:
+    clean_symbol = _normalize_symbol(symbol)
+    now_ts = int(time.time())
+
+    change = None
+    change_percent = None
+
+    if price is not None and previous_close not in (None, 0):
+        change = round(price - previous_close, 4)
+        change_percent = round((change / previous_close) * 100, 4)
+
+    market = "India" if _is_indian_symbol(clean_symbol) else "US"
+
+    return {
+        "symbol": clean_symbol,
+        "name": name or clean_symbol,
+        "price": price,
+        "current_price": price,
+        "change": change,
+        "change_percent": change_percent,
+        "changePercent": change_percent,
+        "previous_close": previous_close,
+        "previousClose": previous_close,
+        "open": open_price,
+        "day_high": day_high,
+        "dayHigh": day_high,
+        "high": day_high,
+        "day_low": day_low,
+        "dayLow": day_low,
+        "low": day_low,
+        "volume": volume,
+        "currency": currency,
+        "exchange": exchange,
+        "market_state": market_state or "unknown",
+        "marketState": (market_state or "unknown").upper(),
+        "timestamp": now_ts,
+        "source": source,
+        "market": market,
+        "asOf": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
+    }
+
+
+def _finnhub_request(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not FINNHUB_API_KEY:
+        raise RuntimeError("FINNHUB_API_KEY is missing")
+
+    req_params = dict(params or {})
+    req_params["token"] = FINNHUB_API_KEY
+
+    url = f"{FINNHUB_BASE_URL}{path}"
+    resp = requests.get(url, params=req_params, timeout=12)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _get_finnhub_quote_us(symbol: str) -> Optional[Dict[str, Any]]:
     try:
-        url = "https://api.upstox.com/v1/instruments/search"
-        params = {
-            "query": normalized,
-            "exchange": "NSE",
-            "segment": "NSE_EQ",
-            "instrument_type": "EQ",
-        }
+        finnhub_symbol = _to_finnhub_symbol(symbol)
+        data = _finnhub_request("/quote", {"symbol": finnhub_symbol})
 
-        resp = requests.get(url, headers=_headers(), params=params, timeout=12)
+        price = _safe_float(data.get("c"))
+        previous_close = _safe_float(data.get("pc"))
+        open_price = _safe_float(data.get("o"))
+        day_high = _safe_float(data.get("h"))
+        day_low = _safe_float(data.get("l"))
 
-        print(f"[UPSTOX SEARCH] status={resp.status_code}")
-        print(f"[UPSTOX SEARCH] raw={resp.text[:1200]}")
+        if price is None:
+            return None
 
-        resp.raise_for_status()
-        payload = resp.json() or {}
-
-        results = payload.get("data") or []
-        if not isinstance(results, list):
-            results = []
-
-        chosen_key = None
-        for item in results:
-            trading_symbol = str(item.get("trading_symbol") or "").upper().strip()
-            segment = str(item.get("segment") or "").upper().strip()
-            instrument_type = str(item.get("instrument_type") or "").upper().strip()
-            instrument_key = item.get("instrument_key")
-
-            if (
-                trading_symbol == normalized
-                and segment == "NSE_EQ"
-                and instrument_type == "EQ"
-                and instrument_key
-            ):
-                chosen_key = instrument_key
-                break
-
-        if not chosen_key and results:
-            for item in results:
-                instrument_key = item.get("instrument_key")
-                if instrument_key:
-                    chosen_key = instrument_key
-                    break
-
-        _SEARCH_CACHE[normalized] = chosen_key
-        print(f"[UPSTOX SEARCH] resolved {normalized} -> {chosen_key}")
-        return chosen_key
-
-    except Exception as e:
-        logger.exception("Upstox instrument search failed for %s: %s", symbol, e)
-        _SEARCH_CACHE[normalized] = None
+        return _finalize_quote(
+            symbol=symbol,
+            price=price,
+            previous_close=previous_close,
+            open_price=open_price,
+            day_high=day_high,
+            day_low=day_low,
+            volume=None,
+            currency="USD",
+            exchange="US",
+            market_state="LIVE",
+            name=_normalize_symbol(symbol),
+            source="finnhub",
+        )
+    except Exception:
+        logger.exception("[QUOTE][US][FINNHUB] failed for %s", symbol)
         return None
+
+
+def _get_yahoo_quote(symbol: str) -> Optional[Dict[str, Any]]:
+    try:
+        yahoo_symbol = _to_yahoo_symbol(symbol)
+        ticker = yf.Ticker(yahoo_symbol)
+
+        info: Dict[str, Any] = {}
+        fast_info: Dict[str, Any] = {}
+
+        try:
+            info = ticker.info or {}
+        except Exception:
+            logger.warning("[QUOTE][YAHOO] info failed for %s", yahoo_symbol)
+
+        try:
+            fast_info = dict(getattr(ticker, "fast_info", {}) or {})
+        except Exception:
+            logger.warning("[QUOTE][YAHOO] fast_info failed for %s", yahoo_symbol)
+
+        price = (
+            _safe_float(fast_info.get("lastPrice"))
+            or _safe_float(info.get("currentPrice"))
+            or _safe_float(info.get("regularMarketPrice"))
+        )
+
+        previous_close = (
+            _safe_float(fast_info.get("previousClose"))
+            or _safe_float(info.get("previousClose"))
+            or _safe_float(info.get("regularMarketPreviousClose"))
+        )
+
+        open_price = (
+            _safe_float(fast_info.get("open"))
+            or _safe_float(info.get("open"))
+            or _safe_float(info.get("regularMarketOpen"))
+        )
+
+        day_high = (
+            _safe_float(fast_info.get("dayHigh"))
+            or _safe_float(info.get("dayHigh"))
+            or _safe_float(info.get("regularMarketDayHigh"))
+        )
+
+        day_low = (
+            _safe_float(fast_info.get("dayLow"))
+            or _safe_float(info.get("dayLow"))
+            or _safe_float(info.get("regularMarketDayLow"))
+        )
+
+        volume = (
+            _safe_int(fast_info.get("lastVolume"), 0)
+            or _safe_int(info.get("volume"), 0)
+            or _safe_int(info.get("regularMarketVolume"), 0)
+        )
+
+        currency = info.get("currency") or fast_info.get("currency")
+        exchange = info.get("exchange") or info.get("fullExchangeName")
+        name = (
+            info.get("shortName")
+            or info.get("longName")
+            or info.get("displayName")
+            or _normalize_symbol(symbol)
+        )
+
+        market_state = info.get("marketState") or "LIVE"
+
+        if price is None or previous_close is None:
+            try:
+                hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+                if hist is not None and not hist.empty:
+                    last_row = hist.iloc[-1]
+                    price = price if price is not None else _safe_float(last_row.get("Close"))
+                    open_price = open_price if open_price is not None else _safe_float(last_row.get("Open"))
+                    day_high = day_high if day_high is not None else _safe_float(last_row.get("High"))
+                    day_low = day_low if day_low is not None else _safe_float(last_row.get("Low"))
+                    volume = volume if volume else _safe_int(last_row.get("Volume"), 0)
+
+                    if len(hist) >= 2 and previous_close is None:
+                        previous_close = _safe_float(hist.iloc[-2].get("Close"))
+            except Exception:
+                logger.warning("[QUOTE][YAHOO] history fallback failed for %s", yahoo_symbol)
+
+        if price is None:
+            return None
+
+        return _finalize_quote(
+            symbol=symbol,
+            price=price,
+            previous_close=previous_close,
+            open_price=open_price,
+            day_high=day_high,
+            day_low=day_low,
+            volume=volume,
+            currency=currency,
+            exchange=exchange,
+            market_state=market_state,
+            name=name,
+            source="yahoo",
+        )
+    except Exception:
+        logger.exception("[QUOTE][YAHOO] failed for %s", symbol)
+        return None
+
+
+def get_quote(symbol: str) -> Dict[str, Any]:
+    clean_symbol = _normalize_symbol(symbol)
+
+    if not clean_symbol:
+        return _empty_quote(symbol, source="invalid")
+
+    if _is_indian_symbol(clean_symbol):
+        yahoo_quote = _get_yahoo_quote(clean_symbol)
+        if yahoo_quote:
+            logger.info("[QUOTE][INDIA][YAHOO] ticker=%s", clean_symbol)
+            return yahoo_quote
+
+        logger.error("[QUOTE][INDIA] empty quote for %s", clean_symbol)
+        return _empty_quote(clean_symbol, source="yahoo_failed")
+
+    finnhub_quote = _get_finnhub_quote_us(clean_symbol)
+    if finnhub_quote:
+        logger.info("[QUOTE][US][FINNHUB] ticker=%s", clean_symbol)
+        return finnhub_quote
+
+    yahoo_fallback = _get_yahoo_quote(clean_symbol)
+    if yahoo_fallback:
+        logger.info("[QUOTE][US][YAHOO_FALLBACK] ticker=%s", clean_symbol)
+        return yahoo_fallback
+
+    logger.error("[QUOTE][US] empty quote for %s", clean_symbol)
+    return _empty_quote(clean_symbol, source="all_failed")
 
 
 def get_upstox_quote(symbol: str):
-    instrument = _search_upstox_instrument(symbol)
-
-    if not instrument:
-        print(f"[UPSTOX] instrument not found for {symbol}")
-        return None
-
-    try:
-        url = "https://api.upstox.com/v3/market-quote/ltp"
-        params = {"instrument_key": instrument}
-
-        print(f"[UPSTOX] symbol={symbol}")
-        print(f"[UPSTOX] instrument={instrument}")
-        print(f"[UPSTOX] token_present={bool((settings.upstox_analytics_token or '').strip())}")
-
-        resp = requests.get(
-            url,
-            headers=_headers(),
-            params=params,
-            timeout=12,
-        )
-
-        print(f"[UPSTOX] status={resp.status_code}")
-        print(f"[UPSTOX] raw={resp.text[:1200]}")
-
-        resp.raise_for_status()
-        payload = resp.json() or {}
-
-        quote = (payload.get("data") or {}).get(instrument)
-        print(f"[UPSTOX DEBUG] full quote = {quote}")
-
-        if not quote:
-            return None
-
-        price = _pick_first_number(
-            quote.get("last_price"),
-            quote.get("ltp"),
-            quote.get("close"),
-            quote.get("price"),
-        )
-
-        prev_close = _pick_first_number(
-            quote.get("cp"),
-            quote.get("prev_close"),
-            quote.get("previous_close"),
-            quote.get("close"),
-        )
-
-        change = None
-        change_percent = None
-
-        if price is not None and prev_close not in (None, 0):
-            change = price - prev_close
-            change_percent = (change / prev_close) * 100
-
-        result = {
-            "price": price,
-            "change": change,
-            "changePercent": change_percent,
-            "prevClose": prev_close,
-        }
-
-        print(f"[UPSTOX] result={result}")
-        return result
-
-    except Exception as e:
-        logger.exception("Upstox quote failed for %s: %s", symbol, e)
-        return None
+    return get_quote(symbol)

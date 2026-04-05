@@ -13,7 +13,7 @@ from cachetools import TTLCache
 from statsmodels.tsa.arima.model import ARIMA
 
 from app.core.cache import ttl_cache
-from app.services.upstox_service import get_upstox_quote
+from app.services.upstox_service import get_quote as unified_get_quote
 
 logger = logging.getLogger(__name__)
 
@@ -97,42 +97,13 @@ def _safe_nonempty_str(*values):
     return None
 
 
-def _extract_fast_value(fast, *keys):
-    if not fast:
+def _pick_row(df: pd.DataFrame, candidates: list[str]) -> pd.Series | None:
+    if df is None or df.empty:
         return None
-    getter = getattr(fast, "get", None)
-    if callable(getter):
-        for key in keys:
-            try:
-                value = getter(key)
-            except Exception:
-                value = None
-            if value is not None:
-                return value
-    for key in keys:
-        try:
-            value = fast[key]
-        except Exception:
-            value = getattr(fast, key, None)
-        if value is not None:
-            return value
+    for name in candidates:
+        if name in df.index:
+            return df.loc[name]
     return None
-
-
-def _empty_quote(ticker: str) -> dict:
-    market, currency = _default_market_currency(ticker)
-    return {
-        "symbol": ticker,
-        "name": ticker,
-        "exchange": None,
-        "market": market,
-        "currency": currency,
-        "price": None,
-        "change": None,
-        "changePercent": None,
-        "marketState": None,
-        "asOf": _now_iso(),
-    }
 
 
 def _empty_profile(symbol: str) -> dict:
@@ -164,74 +135,6 @@ def _empty_ratios(symbol: str) -> dict:
         "current_ratio": None,
         "quick_ratio": None,
     }
-
-
-def _fetch_history_df(
-    ticker: str,
-    period: str,
-    interval: str,
-    *,
-    for_label: str = "history",
-) -> pd.DataFrame | None:
-    df = None
-
-    if _finnhub_enabled():
-        try:
-            df = _finnhub_fetch_candles(ticker, period, interval)
-        except Exception:
-            logger.exception(
-                "Finnhub %s fetch failed for ticker=%s interval=%s period=%s",
-                for_label,
-                ticker,
-                interval,
-                period,
-            )
-
-    if df is not None and not df.empty:
-        return _normalize_download_df(df)
-
-    t = yf.Ticker(ticker)
-
-    try:
-        df = t.history(
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            actions=False,
-        )
-    except Exception:
-        logger.exception(
-            "yfinance primary %s fetch failed for ticker=%s interval=%s period=%s",
-            for_label,
-            ticker,
-            interval,
-            period,
-        )
-
-    df = _normalize_download_df(df)
-
-    if df is None or df.empty:
-        try:
-            df = yf.download(
-                ticker,
-                period=period,
-                interval=interval,
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-            )
-        except Exception:
-            logger.exception(
-                "yfinance fallback %s download failed for ticker=%s interval=%s period=%s",
-                for_label,
-                ticker,
-                interval,
-                period,
-            )
-            return None
-
-    df = _normalize_download_df(df)
-    return df
 
 
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
@@ -422,38 +325,6 @@ def _finnhub_search_symbols(q: str, market: str = "ALL", limit: int = 10) -> lis
     return out
 
 
-def _finnhub_quote(symbol: str) -> dict | None:
-    finnhub_symbol = _to_finnhub_symbol(symbol)
-    data = _finnhub_request("/quote", {"symbol": finnhub_symbol})
-    if not isinstance(data, dict):
-        return None
-
-    current = _safe_float_or_none(data.get("c"))
-    previous_close = _safe_float_or_none(data.get("pc"))
-
-    if current is None and previous_close is None:
-        return None
-
-    change = _safe_float_or_none(data.get("d"))
-    change_percent = _safe_float_or_none(data.get("dp"))
-
-    if current is not None and change is None and previous_close is not None:
-        change = current - previous_close
-    if current is not None and change_percent is None and previous_close not in (None, 0):
-        change_percent = ((current - previous_close) / previous_close) * 100
-
-    return {
-        "price": current,
-        "change": change,
-        "changePercent": change_percent,
-        "prevClose": previous_close,
-        "high": _safe_float_or_none(data.get("h")),
-        "low": _safe_float_or_none(data.get("l")),
-        "open": _safe_float_or_none(data.get("o")),
-        "timestamp": data.get("t"),
-    }
-
-
 def _finnhub_company_profile(symbol: str) -> dict | None:
     finnhub_symbol = _to_finnhub_symbol(symbol)
     profile = _finnhub_request("/stock/profile2", {"symbol": finnhub_symbol})
@@ -491,6 +362,74 @@ def _prepare_series_for_arima(series: pd.Series, freq: str) -> pd.Series:
     s = s.asfreq(freq)
     s = s.ffill().dropna()
     return s
+
+
+def _fetch_history_df(
+    ticker: str,
+    period: str,
+    interval: str,
+    *,
+    for_label: str = "history",
+) -> pd.DataFrame | None:
+    df = None
+
+    if _finnhub_enabled():
+        try:
+            df = _finnhub_fetch_candles(ticker, period, interval)
+        except Exception:
+            logger.exception(
+                "Finnhub %s fetch failed for ticker=%s interval=%s period=%s",
+                for_label,
+                ticker,
+                interval,
+                period,
+            )
+
+    if df is not None and not df.empty:
+        return _normalize_download_df(df)
+
+    t = yf.Ticker(ticker)
+
+    try:
+        df = t.history(
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            actions=False,
+        )
+    except Exception:
+        logger.exception(
+            "yfinance primary %s fetch failed for ticker=%s interval=%s period=%s",
+            for_label,
+            ticker,
+            interval,
+            period,
+        )
+
+    df = _normalize_download_df(df)
+
+    if df is None or df.empty:
+        try:
+            df = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+        except Exception:
+            logger.exception(
+                "yfinance fallback %s download failed for ticker=%s interval=%s period=%s",
+                for_label,
+                ticker,
+                interval,
+                period,
+            )
+            return None
+
+    df = _normalize_download_df(df)
+    return df
 
 
 @ttl_cache(prefix="symbol_search", ttl_seconds=120)
@@ -531,10 +470,7 @@ def search_symbols(q: str, market: str = "ALL", limit: int = 10) -> dict:
                 continue
 
             market_value = exchange if market == "ALL" else market
-
-            currency = item.get("currency")
-            if not currency:
-                currency = "INR" if (symbol.endswith(".NS") or symbol.endswith(".BO")) else "USD"
+            currency = item.get("currency") or ("INR" if (symbol.endswith(".NS") or symbol.endswith(".BO")) else "USD")
 
             results.append(
                 {
@@ -1117,15 +1053,6 @@ def get_correlation_matrix(tickers: list[str], range_: str = "6mo") -> dict:
         return {"tickers": tickers, "range": range_, "matrix": fallback}
 
 
-def _pick_row(df: pd.DataFrame, candidates: list[str]) -> pd.Series | None:
-    if df is None or df.empty:
-        return None
-    for name in candidates:
-        if name in df.index:
-            return df.loc[name]
-    return None
-
-
 @ttl_cache(prefix="revenue_expenses", ttl_seconds=3600)
 def get_revenue_expenses(ticker: str, frequency: str = "quarterly") -> dict:
     ticker = ticker.strip().upper()
@@ -1201,357 +1128,44 @@ def _now_iso():
 
 
 def get_quote(ticker: str) -> dict:
-    ticker = ticker.strip().upper()
-
-    cached = _quote_cache.get(ticker)
-    if cached:
-        cached_price = cached.get("price")
-        if cached_price in (None, 0, 0.0):
-            print(f"[QUOTE] ignoring bad cache for {ticker}: {cached}")
-        else:
-            print(f"[QUOTE] valid cache hit for {ticker}: {cached}")
-            return cached
-
-    market_default, currency_default = _default_market_currency(ticker)
-
-    base_out = {
-        "symbol": ticker,
-        "name": ticker,
-        "exchange": None,
-        "market": market_default,
-        "currency": currency_default,
-        "price": None,
-        "change": None,
-        "changePercent": None,
-        "marketState": "CLOSED",
-        "asOf": _now_iso(),
-    }
-
-    print(f"[QUOTE] ticker={ticker}")
-    print(f"[QUOTE] finnhub_enabled={_finnhub_enabled()}")
-
-    # INDIA FLOW: Upstox -> Finnhub -> stop
-    if ticker.endswith(".NS") or ticker.endswith(".BO"):
-        exchange_name = "NSE" if ticker.endswith(".NS") else "BSE"
-
-        # 1) Upstox
-        try:
-            upstox_q = get_upstox_quote(ticker)
-            print(f"[QUOTE] upstox_q for {ticker}: {upstox_q}")
-
-            if upstox_q:
-                price = _safe_float_or_none(upstox_q.get("price"))
-                prev_close = _safe_float_or_none(upstox_q.get("prevClose"))
-                change = _safe_float_or_none(upstox_q.get("change"))
-                change_pct = _safe_float_or_none(upstox_q.get("changePercent"))
-
-                if price is not None and change is None and prev_close not in (None, 0):
-                    change = price - prev_close
-
-                if price is not None and change_pct is None and prev_close not in (None, 0):
-                    change_pct = ((price - prev_close) / prev_close) * 100
-
-                if price not in (None, 0, 0.0):
-                    out = {
-                        "symbol": ticker,
-                        "name": ticker,
-                        "exchange": exchange_name,
-                        "market": "India",
-                        "currency": "INR",
-                        "price": price,
-                        "change": change,
-                        "changePercent": change_pct,
-                        "marketState": "LIVE",
-                        "asOf": _now_iso(),
-                    }
-                    print(f"[QUOTE] returning UPSTOX result for {ticker}: {out}")
-                    _quote_cache[ticker] = out
-                    return out
-
-            print(f"[QUOTE] Upstox returned no usable price for {ticker}, trying Finnhub")
-        except Exception as e:
-            print(f"[QUOTE] Upstox failed for {ticker}: {e}")
-            logger.exception("Upstox quote failed for ticker=%s", ticker)
-
-        # 2) Finnhub fallback for India
-        try:
-            finnhub_q = _finnhub_quote(ticker)
-            print(f"[QUOTE] finnhub_q for India ticker {ticker}: {finnhub_q}")
-
-            if finnhub_q:
-                price = _safe_float_or_none(finnhub_q.get("price"))
-                prev_close = _safe_float_or_none(finnhub_q.get("prevClose"))
-                change = _safe_float_or_none(finnhub_q.get("change"))
-                change_pct = _safe_float_or_none(finnhub_q.get("changePercent"))
-
-                if price is not None and change is None and prev_close not in (None, 0):
-                    change = price - prev_close
-
-                if price is not None and change_pct is None and prev_close not in (None, 0):
-                    change_pct = ((price - prev_close) / prev_close) * 100
-
-                if price not in (None, 0, 0.0):
-                    out = {
-                        "symbol": ticker,
-                        "name": ticker,
-                        "exchange": exchange_name,
-                        "market": "India",
-                        "currency": "INR",
-                        "price": price,
-                        "change": change,
-                        "changePercent": change_pct,
-                        "marketState": "LIVE",
-                        "asOf": _now_iso(),
-                    }
-                    print(f"[QUOTE] returning FINNHUB fallback result for {ticker}: {out}")
-                    _quote_cache[ticker] = out
-                    return out
-
-            print(f"[QUOTE] Finnhub also returned no usable price for {ticker}")
-        except Exception as e:
-            print(f"[QUOTE] Finnhub fallback failed for {ticker}: {e}")
-            logger.exception("Finnhub fallback failed for Indian ticker=%s", ticker)
-
-        # 3) No Yahoo for India
-        print(f"[QUOTE] No valid India data source returned price for {ticker}")
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        market, currency = _default_market_currency(ticker)
         return {
             "symbol": ticker,
             "name": ticker,
-            "exchange": exchange_name,
-            "market": "India",
-            "currency": "INR",
+            "exchange": None,
+            "market": market,
+            "currency": currency,
             "price": None,
             "change": None,
             "changePercent": None,
-            "marketState": "CLOSED",
+            "marketState": "UNKNOWN",
             "asOf": _now_iso(),
         }
 
-    # US / NON-INDIA FLOW
-    price = None
-    prev_close = None
-    change = None
-    change_pct = None
-    name = ticker
-    exchange = None
-    market = market_default
-    currency = currency_default
-    market_state = "CLOSED"
+    cached = _quote_cache.get(ticker)
+    if cached and cached.get("price") not in (None, 0, 0.0):
+        return cached
 
-    def _clean_num(value):
-        num = _safe_float_or_none(value)
-        if num in (None, 0, 0.0):
-            return None
-        return num
+    out = unified_get_quote(ticker) or {}
+    result = {
+        "symbol": out.get("symbol", ticker),
+        "name": out.get("name", ticker),
+        "exchange": out.get("exchange"),
+        "market": out.get("market") or _default_market_currency(ticker)[0],
+        "currency": out.get("currency") or _default_market_currency(ticker)[1],
+        "price": out.get("price"),
+        "change": out.get("change"),
+        "changePercent": out.get("changePercent"),
+        "marketState": out.get("marketState"),
+        "asOf": out.get("asOf") or _now_iso(),
+    }
 
-    # 1) FINNHUB QUOTE FIRST (US)
-    if _finnhub_enabled():
-        try:
-            finnhub_q = _finnhub_quote(ticker)
-            finnhub_profile = _finnhub_company_profile(ticker)
+    if result.get("price") not in (None, 0, 0.0):
+        _quote_cache[ticker] = result
 
-            print(f"[QUOTE] finnhub_q for {ticker}: {finnhub_q}")
-            print(f"[QUOTE] finnhub_profile for {ticker}: {finnhub_profile}")
-
-            if finnhub_profile:
-                name = finnhub_profile.get("name") or name
-                exchange = finnhub_profile.get("exchange") or exchange
-                currency = finnhub_profile.get("currency") or currency
-                market = _infer_market_from_exchange(exchange, ticker)
-
-            if finnhub_q:
-                price = _clean_num(finnhub_q.get("price"))
-                prev_close = _clean_num(finnhub_q.get("prevClose"))
-                change = _clean_num(finnhub_q.get("change"))
-                change_pct = _clean_num(finnhub_q.get("changePercent"))
-
-            print(
-                f"[QUOTE] after finnhub quote -> "
-                f"price={price}, prev_close={prev_close}, change={change}, change_pct={change_pct}"
-            )
-
-            if _is_valid_price(price):
-                if change is None and prev_close not in (None, 0):
-                    change = float(price) - float(prev_close)
-                if change_pct is None and prev_close not in (None, 0):
-                    change_pct = (float(price) - float(prev_close)) / float(prev_close) * 100
-
-                out = {
-                    "symbol": ticker,
-                    "name": name or ticker,
-                    "exchange": exchange,
-                    "market": market or market_default,
-                    "currency": currency or currency_default,
-                    "price": price,
-                    "change": _safe_float_or_none(change),
-                    "changePercent": _safe_float_or_none(change_pct),
-                    "marketState": "LIVE",
-                    "asOf": _now_iso(),
-                }
-                print(f"[QUOTE] returning finnhub quote result for {ticker}: {out}")
-                if out.get("price") not in (None, 0, 0.0):
-                    _quote_cache[ticker] = out
-                return out
-
-        except Exception as e:
-            print(f"[QUOTE] Finnhub primary quote failed for {ticker}: {e}")
-            logger.exception("Finnhub primary quote failed for ticker=%s", ticker)
-
-    # 2) YFINANCE FALLBACK (US ONLY)
-    try:
-        print(f"[QUOTE] entering yahoo fallback for {ticker}")
-
-        try:
-            t = yf.Ticker(ticker)
-        except Exception as e:
-            print(f"[QUOTE] Yahoo init failed for {ticker}: {e}")
-            t = None
-
-        fast = {}
-        if t is not None:
-            try:
-                fast = t.fast_info or {}
-            except Exception as e:
-                print(f"[QUOTE] fast_info failed for {ticker}: {e}")
-                fast = {}
-
-        print(f"[QUOTE] fast_info keys for {ticker}: {list(fast.keys()) if hasattr(fast, 'keys') else fast}")
-
-        if fast:
-            try:
-                last_price_val = fast.get("lastPrice")
-            except Exception:
-                last_price_val = None
-
-            try:
-                prev_close_val = fast.get("previousClose")
-            except Exception:
-                prev_close_val = None
-
-            try:
-                currency_val = fast.get("currency")
-            except Exception:
-                currency_val = None
-
-            price = _clean_num(last_price_val) if not _is_valid_price(price) else price
-            prev_close = _clean_num(prev_close_val) if prev_close is None else prev_close
-            currency = _safe_nonempty_str(currency_val) or currency
-
-            print(f"[QUOTE] FORCE fast_info price={price}, prev_close={prev_close}")
-
-        if not _is_valid_price(price):
-            try:
-                dl = yf.download(
-                    ticker,
-                    period="5d",
-                    interval="1d",
-                    progress=False,
-                    threads=False,
-                    auto_adjust=False,
-                )
-                dl = _normalize_download_df(dl)
-
-                print(f"[QUOTE] direct download empty for {ticker}? {dl is None or dl.empty}")
-
-                if dl is not None and not dl.empty and "Close" in dl.columns:
-                    closes = dl["Close"].dropna()
-                    if len(closes) >= 1:
-                        price = _clean_num(closes.iloc[-1])
-                    if len(closes) >= 2:
-                        prev_close = _clean_num(closes.iloc[-2])
-
-                    print(f"[QUOTE] after direct download -> price={price}, prev_close={prev_close}")
-
-            except Exception as e:
-                print(f"[QUOTE] direct download failed for {ticker}: {e}")
-
-        info = {}
-        if t is not None:
-            try:
-                info = t.info or {}
-            except Exception as e:
-                print(f"[QUOTE] info failed for {ticker}: {e}")
-                info = {}
-
-        if info:
-            name = (
-                info.get("shortName")
-                or info.get("longName")
-                or info.get("displayName")
-                or info.get("name")
-                or name
-            )
-            exchange = (
-                exchange
-                or info.get("exchange")
-                or info.get("fullExchangeName")
-                or info.get("quoteExchange")
-            )
-            market = (
-                info.get("market")
-                or info.get("marketType")
-                or info.get("exchangeTimezoneName")
-                or market
-            )
-            currency = info.get("currency") or currency
-            market_state = info.get("marketState") or market_state
-
-            if not _is_valid_price(price):
-                price = _clean_num(
-                    info.get("regularMarketPrice")
-                    or info.get("currentPrice")
-                    or info.get("previousClose")
-                )
-
-            if prev_close is None:
-                prev_close = _clean_num(
-                    info.get("regularMarketPreviousClose")
-                    or info.get("previousClose")
-                )
-
-        if not _is_valid_price(price):
-            price = None
-        if prev_close in (0, 0.0):
-            prev_close = None
-
-        if change is None and _is_valid_price(price) and prev_close not in (None, 0):
-            change = float(price) - float(prev_close)
-
-        if change_pct is None and _is_valid_price(price) and prev_close not in (None, 0):
-            change_pct = (float(price) - float(prev_close)) / float(prev_close) * 100
-
-        if price is None:
-            change = None
-            change_pct = None
-
-        out = {
-            "symbol": ticker,
-            "name": name or ticker,
-            "exchange": exchange,
-            "market": market or market_default,
-            "currency": currency or currency_default,
-            "price": _safe_float_or_none(price),
-            "change": _safe_float_or_none(change),
-            "changePercent": _safe_float_or_none(change_pct),
-            "marketState": market_state,
-            "asOf": _now_iso(),
-        }
-
-        print(f"[QUOTE] returning yahoo fallback result for {ticker}: {out}")
-
-        if out.get("price") not in (None, 0, 0.0):
-            _quote_cache[ticker] = out
-
-        return out
-
-    except Exception as e:
-        print(f"[QUOTE] final fallback used for {ticker}: {e}")
-        logger.exception("Unhandled get_quote failure for ticker=%s", ticker)
-        fallback = {
-            **base_out,
-            "asOf": _now_iso(),
-        }
-        return fallback
+    return result
 
 
 def get_company_profile(symbol: str) -> dict:
