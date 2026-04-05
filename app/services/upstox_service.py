@@ -206,84 +206,24 @@ def _get_yahoo_quote(symbol: str) -> Optional[Dict[str, Any]]:
         yahoo_symbol = _to_yahoo_symbol(symbol)
         ticker = yf.Ticker(yahoo_symbol)
 
-        info: Dict[str, Any] = {}
-        fast_info: Dict[str, Any] = {}
+        # 🔥 FORCE history-based pricing (most reliable on Render)
+        hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
 
-        try:
-            info = ticker.info or {}
-        except Exception:
-            logger.warning("[QUOTE][YAHOO] info failed for %s", yahoo_symbol)
-
-        try:
-            fast_info = dict(getattr(ticker, "fast_info", {}) or {})
-        except Exception:
-            logger.warning("[QUOTE][YAHOO] fast_info failed for %s", yahoo_symbol)
-
-        price = (
-            _safe_float(fast_info.get("lastPrice"))
-            or _safe_float(info.get("currentPrice"))
-            or _safe_float(info.get("regularMarketPrice"))
-        )
-
-        previous_close = (
-            _safe_float(fast_info.get("previousClose"))
-            or _safe_float(info.get("previousClose"))
-            or _safe_float(info.get("regularMarketPreviousClose"))
-        )
-
-        open_price = (
-            _safe_float(fast_info.get("open"))
-            or _safe_float(info.get("open"))
-            or _safe_float(info.get("regularMarketOpen"))
-        )
-
-        day_high = (
-            _safe_float(fast_info.get("dayHigh"))
-            or _safe_float(info.get("dayHigh"))
-            or _safe_float(info.get("regularMarketDayHigh"))
-        )
-
-        day_low = (
-            _safe_float(fast_info.get("dayLow"))
-            or _safe_float(info.get("dayLow"))
-            or _safe_float(info.get("regularMarketDayLow"))
-        )
-
-        volume = (
-            _safe_int(fast_info.get("lastVolume"), 0)
-            or _safe_int(info.get("volume"), 0)
-            or _safe_int(info.get("regularMarketVolume"), 0)
-        )
-
-        currency = info.get("currency") or fast_info.get("currency")
-        exchange = info.get("exchange") or info.get("fullExchangeName")
-        name = (
-            info.get("shortName")
-            or info.get("longName")
-            or info.get("displayName")
-            or _normalize_symbol(symbol)
-        )
-
-        market_state = info.get("marketState") or "LIVE"
-
-        if price is None or previous_close is None:
-            try:
-                hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
-                if hist is not None and not hist.empty:
-                    last_row = hist.iloc[-1]
-                    price = price if price is not None else _safe_float(last_row.get("Close"))
-                    open_price = open_price if open_price is not None else _safe_float(last_row.get("Open"))
-                    day_high = day_high if day_high is not None else _safe_float(last_row.get("High"))
-                    day_low = day_low if day_low is not None else _safe_float(last_row.get("Low"))
-                    volume = volume if volume else _safe_int(last_row.get("Volume"), 0)
-
-                    if len(hist) >= 2 and previous_close is None:
-                        previous_close = _safe_float(hist.iloc[-2].get("Close"))
-            except Exception:
-                logger.warning("[QUOTE][YAHOO] history fallback failed for %s", yahoo_symbol)
-
-        if price is None:
+        if hist is None or hist.empty:
+            logger.error("[YAHOO] history empty for %s", yahoo_symbol)
             return None
+
+        last = hist.iloc[-1]
+
+        price = _safe_float(last.get("Close"))
+        open_price = _safe_float(last.get("Open"))
+        day_high = _safe_float(last.get("High"))
+        day_low = _safe_float(last.get("Low"))
+        volume = _safe_int(last.get("Volume"))
+
+        previous_close = None
+        if len(hist) >= 2:
+            previous_close = _safe_float(hist.iloc[-2].get("Close"))
 
         return _finalize_quote(
             symbol=symbol,
@@ -293,12 +233,13 @@ def _get_yahoo_quote(symbol: str) -> Optional[Dict[str, Any]]:
             day_high=day_high,
             day_low=day_low,
             volume=volume,
-            currency=currency,
-            exchange=exchange,
-            market_state=market_state,
-            name=name,
-            source="yahoo",
+            currency="INR" if _is_indian_symbol(symbol) else "USD",
+            exchange="NSE" if _is_indian_symbol(symbol) else "US",
+            market_state="LIVE",
+            name=_normalize_symbol(symbol),
+            source="yahoo_history",
         )
+
     except Exception:
         logger.exception("[QUOTE][YAHOO] failed for %s", symbol)
         return None
