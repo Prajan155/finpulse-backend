@@ -54,33 +54,41 @@ def _empty(symbol):
 # =========================
 def _get_twelve_quote(symbol: str):
     if not TWELVE_API_KEY:
+        logger.error("[TWELVE] API key missing")
         return None
 
     try:
-        sym = _to_twelve_symbol(symbol)
+        sym = symbol.upper().replace(".NS", "")
+
+        # 🔥 FIXED FORMAT
+        full_symbol = f"{sym}.NSE"
 
         url = f"{TWELVE_BASE}/quote"
         params = {
-            "symbol": sym,
-            "exchange": "NSE",
+            "symbol": full_symbol,
             "apikey": TWELVE_API_KEY,
         }
 
-        r = requests.get(url, params=params, timeout=8)
+        logger.info("[TWELVE] requesting %s", full_symbol)
+
+        r = requests.get(url, params=params, timeout=10)
+        logger.info("[TWELVE] response: %s", r.text[:300])
+
         data = r.json()
 
-        if "price" not in data:
+        # ❗ HANDLE API ERROR
+        if "code" in data:
+            logger.error("[TWELVE ERROR] %s", data)
             return None
 
         price = _safe_float(data.get("price"))
         prev_close = _safe_float(data.get("previous_close"))
 
-        change = None
-        change_pct = None
+        if price is None:
+            return None
 
-        if price and prev_close:
-            change = price - prev_close
-            change_pct = (change / prev_close) * 100
+        change = price - prev_close if prev_close else None
+        change_pct = (change / prev_close * 100) if prev_close else None
 
         return {
             "symbol": symbol,
@@ -96,7 +104,7 @@ def _get_twelve_quote(symbol: str):
         }
 
     except Exception:
-        logger.exception("[TWELVE] failed for %s", symbol)
+        logger.exception("[TWELVE] failed")
         return None
 
 
