@@ -1,15 +1,14 @@
-import os
 import time
 import logging
 from typing import Any, Dict, Optional
-
+from app.core.config import settings
 import requests
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
-TWELVE_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+FINNHUB_API_KEY = (settings.finnhub_api_key or "").strip()
+TWELVE_API_KEY = (getattr(settings, "twelve_data_api_key", "") or "").strip()
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 TWELVE_BASE = "https://api.twelvedata.com"

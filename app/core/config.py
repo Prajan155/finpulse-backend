@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     database_url: str
     gemini_api_key: str = ""
     finnhub_api_key: str = ""
+    twelve_data_api_key: str = ""
 
     upstox_analytics_token: str = ""
     upstox_base_url: str = "https://api.upstox.com/v2"
