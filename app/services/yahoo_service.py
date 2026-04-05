@@ -13,7 +13,10 @@ from cachetools import TTLCache
 from statsmodels.tsa.arima.model import ARIMA
 
 from app.core.cache import ttl_cache
-from app.services.upstox_service import get_quote as unified_get_quote
+from app.services.upstox_service import (
+    get_quote as unified_get_quote,
+    get_quotes_batch as unified_get_quotes_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1145,7 +1148,7 @@ def get_quote(ticker: str) -> dict:
         }
 
     cached = _quote_cache.get(ticker)
-    if cached and cached.get("price") not in (None, 0, 0.0):
+    if cached is not None:
         return cached
 
     out = unified_get_quote(ticker) or {}
@@ -1162,9 +1165,7 @@ def get_quote(ticker: str) -> dict:
         "asOf": out.get("asOf") or _now_iso(),
     }
 
-    if result.get("price") not in (None, 0, 0.0):
-        _quote_cache[ticker] = result
-
+    _quote_cache[ticker] = result
     return result
 
 
@@ -1220,4 +1221,31 @@ def get_company_profile(symbol: str) -> dict:
 
 
 def get_quotes_batch(tickers: list[str]) -> list[dict]:
+    tickers = [(tk or "").strip().upper() for tk in tickers if (tk or "").strip()]
+    if not tickers:
+        return []
+
+    try:
+        batch = unified_get_quotes_batch(tickers)
+        if batch:
+            normalized = []
+            for item, ticker in zip(batch, tickers):
+                normalized.append(
+                    {
+                        "symbol": item.get("symbol", ticker),
+                        "name": item.get("name", ticker),
+                        "exchange": item.get("exchange"),
+                        "market": item.get("market") or _default_market_currency(ticker)[0],
+                        "currency": item.get("currency") or _default_market_currency(ticker)[1],
+                        "price": item.get("price"),
+                        "change": item.get("change"),
+                        "changePercent": item.get("changePercent"),
+                        "marketState": item.get("marketState"),
+                        "asOf": item.get("asOf") or _now_iso(),
+                    }
+                )
+            return normalized
+    except Exception:
+        logger.exception("Unified batch quotes failed for tickers=%s", tickers)
+
     return [get_quote(tk) for tk in tickers]
